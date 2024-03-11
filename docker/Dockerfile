@@ -24,7 +24,7 @@ RUN pip install deepspeed
 RUN pip install xtts-api-server
 
 # Expose the container ports
-EXPOSE 8020
+EXPOSE 6006
 
 # Run xtts_api_server when the container starts
-CMD ["bash", "-c", "python3 -m xtts_api_server --listen -p 8020 -t 'http://localhost:8020' -sf 'xtts-server/speakers' -o 'xtts-server/output' -mf 'xtts-server/models' --deepspeed"]
+CMD ["bash", "-c", "python3 -m xtts_api_server --listen -p 6006 -t 'http://localhost:6006' -sf 'xtts-server/speakers' -o 'xtts-server/output' -mf 'xtts-server/models' --deepspeed"]

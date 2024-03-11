@@ -409,9 +409,9 @@ class TTSWrapper:
 
     # Special format for SillyTavern
     def get_speakers_special(self):
-        BASE_URL = os.getenv('BASE_URL', '127.0.0.1:8020')
+        BASE_URL = os.getenv('BASE_URL', '127.0.0.1:6006')
         BASE_HOST = os.getenv('BASE_HOST', '127.0.0.1')
-        BASE_PORT = os.getenv('BASE_PORT', '8020')
+        BASE_PORT = os.getenv('BASE_PORT', '6006')
         TUNNEL_URL = os.getenv('TUNNEL_URL', '')
 
         is_local_host = BASE_HOST == '127.0.0.1' or BASE_HOST == "localhost"
