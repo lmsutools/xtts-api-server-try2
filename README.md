@@ -1,7 +1,9 @@
 # Additional Installs
 apt install libportaudio2 libportaudiocpp0 portaudio19-dev
 pip install pyaudio
+
 pip install -r requirements.txt
+pip install xtts_api_server
 
 # A simple FastAPI Server to run XTTSv2
 
