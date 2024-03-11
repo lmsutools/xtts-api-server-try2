@@ -1,5 +1,5 @@
 # tts.py
-
+ 
 import torch
 import torchaudio
 
@@ -515,7 +515,7 @@ class TTSWrapper:
                 file_path=output_file,
         )
 
-    def get_speaker_wav(self, speaker_name_or_path):
+    def get_speaker_wav(self, speaker_name_or_path): 
         """ Gets the speaker_wav(s) for a given speaker name. """
         if speaker_name_or_path.endswith('.wav'):
             # it's a file name

@@ -221,121 +221,53 @@ def set_tts_settings_endpoint(tts_settings_req: TTSSettingsRequest):
         logger.error(e)
         raise HTTPException(status_code=400, detail=str(e))
 
-@app.get('/tts_stream')
-async def tts_stream(request: Request, text: str = Query(), speaker_wav: str = Query(), language: str = Query()):
-    # Validate local model source.
-    if XTTS.model_source != "local":
-        raise HTTPException(status_code=400,
-                            detail="HTTP Streaming is only supported for local models.")
-    # Validate language code against supported languages.
-    if language.lower() not in supported_languages:
-        raise HTTPException(status_code=400,
-                            detail="Language code sent is either unsupported or misspelled.")
-            
-    async def generator():
-        chunks = XTTS.process_tts_to_file(
-            text=text,
-            speaker_name_or_path=speaker_wav,
-            language=language.lower(),
-            stream=True,
-        )
-        # Write file header to the output stream.
-        yield XTTS.get_wav_header()
-        async for chunk in chunks:
-            # Check if the client is still connected.
-            disconnected = await request.is_disconnected()
-            if disconnected:
-                break
-            yield chunk
-
-    return StreamingResponse(generator(), media_type='audio/x-wav')
-
 @app.post("/tts_to_audio/")
-async def tts_to_audio(request: SynthesisRequest, background_tasks: BackgroundTasks):
-    if STREAM_MODE or STREAM_MODE_IMPROVE:
-        try:
-            global stream
-            # Validate language code against supported languages.
-            if request.language.lower() not in supported_languages:
-                raise HTTPException(status_code=400,
-                                    detail="Language code sent is either unsupported or misspelled.")
+async def tts_to_audio(request: SynthesisRequest):
+    try:
+        # Validate language code against supported languages.
+        if request.language.lower() not in supported_languages:
+            raise HTTPException(status_code=400,
+                                detail="Language code sent is either unsupported or misspelled.")
 
-            speaker_wav = XTTS.get_speaker_wav(request.speaker_wav)
-            language = request.language[0:2]
-
-            if stream.is_playing() and not STREAM_PLAY_SYNC:
-                stream.stop()
-                stream = TextToAudioStream(engine)
-
-            engine.set_voice(speaker_wav)
-            engine.language = request.language.lower()
-           
-            # Start streaming, works only on your local computer.
-            stream.feed(request.text)
-            play_stream(stream,language)
-
-            # It's a hack, just send 1 second of silence so that there is no sillyTavern error.
-            this_dir = Path(__file__).parent.resolve()
-            output = this_dir / "RealtimeTTS" / "silence.wav"
-
-            return FileResponse(
-                path=output,
-                media_type='audio/wav',
-                filename="silence.wav",
-            )
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
-    else:
-        try:
-            if XTTS.model_source == "local":
-              logger.info(f"Processing TTS to audio with request: {request}")
-
-            # Validate language code against supported languages.
-            if request.language.lower() not in supported_languages:
-                raise HTTPException(status_code=400,
-                                    detail="Language code sent is either unsupported or misspelled.")
-
-            # Generate an audio file using process_tts_to_file.
-            output_file_path = XTTS.process_tts_to_file(
+        async def generator():
+            chunks = XTTS.process_tts_to_file(
                 text=request.text,
                 speaker_name_or_path=request.speaker_wav,
                 language=request.language.lower(),
-                file_name_or_path=f'{str(uuid4())}.wav'
+                stream=True,
             )
+            # Write file header to the output stream.
+            yield XTTS.get_wav_header()
+            async for chunk in chunks:
+                yield chunk
 
-            if not XTTS.enable_cache_results:
-                background_tasks.add_task(os.unlink, output_file_path)
+        return StreamingResponse(generator(), media_type='audio/x-wav')
 
-            # Return the file in the response
-            return FileResponse(
-                path=output_file_path,
-                media_type='audio/wav',
-                filename="output.wav",
-                )
-
-        except Exception as e:
-            logger.error(e)
-            raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+    except Exception as e:
+        logger.error(e)
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
 @app.post("/tts_to_file")
 async def tts_to_file(request: SynthesisFileRequest):
     try:
-        if XTTS.model_source == "local":
-          logger.info(f"Processing TTS to file with request: {request}")
-
         # Validate language code against supported languages.
         if request.language.lower() not in supported_languages:
-             raise HTTPException(status_code=400,
-                                 detail="Language code sent is either unsupported or misspelled.")
+            raise HTTPException(status_code=400,
+                                detail="Language code sent is either unsupported or misspelled.")
 
-        # Now use process_tts_to_file for saving the file.
-        output_file = XTTS.process_tts_to_file(
-            text=request.text,
-            speaker_name_or_path=request.speaker_wav,
-            language=request.language.lower(),
-            file_name_or_path=request.file_name_or_path  # The user-provided path to save the file is used here.
-        )
-        return {"message": "The audio was successfully made and stored.", "output_path": output_file}
+        async def generator():
+            chunks = XTTS.process_tts_to_file(
+                text=request.text,
+                speaker_name_or_path=request.speaker_wav,
+                language=request.language.lower(),
+                stream=True,
+            )
+            # Write file header to the output stream.
+            yield XTTS.get_wav_header()
+            async for chunk in chunks:
+                yield chunk
+
+        return StreamingResponse(generator(), media_type='audio/x-wav')
 
     except Exception as e:
         logger.error(e)
