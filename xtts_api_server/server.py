@@ -3,7 +3,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse,StreamingResponse
 
-from pydantic import BaseModel
+from pydantic import BaseModel, BaseConfig
 import uvicorn
 
 import os
@@ -39,6 +39,12 @@ STREAM_PLAY_SYNC = os.getenv("STREAM_PLAY_SYNC") == 'true'
 
 if(DEEPSPEED):
   install_deepspeed_based_on_python_version()
+
+class CustomConfig(BaseConfig):
+    arbitrary_types_allowed = True
+    protected_namespaces = ()
+
+BaseModel.Config = CustomConfig
 
 # Create an instance of the TTSWrapper class and server
 app = FastAPI()
