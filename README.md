@@ -1,3 +1,8 @@
+# Additional Installs
+apt install libportaudio2 libportaudiocpp0 portaudio19-dev
+pip install pyaudio
+pip install -r requirements.txt
+
 # A simple FastAPI Server to run XTTSv2
 
 This project is inspired by [silero-api-server](https://github.com/ouoertheo/silero-api-server) and utilizes [XTTSv2](https://github.com/coqui-ai/TTS).

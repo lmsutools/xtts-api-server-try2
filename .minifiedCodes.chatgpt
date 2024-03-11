@@ -1,0 +1,3043 @@
+<"file: xtts_api_server\tts_funcs.py"># tts.py
+ 
+import torch
+import torchaudio
+
+from TTS.api import TTS
+
+from TTS.tts.configs.xtts_config import XttsConfig
+from TTS.tts.models.xtts import Xtts
+from pathlib import Path
+
+from xtts_api_server.modeldownloader import download_model,check_tts_version
+
+from loguru import logger
+from datetime import datetime
+import os
+import time 
+import re
+import json
+import socket
+import io
+import wave
+import numpy as np
+
+# Class to check tts settings
+class InvalidSettingsError(Exception):
+    pass
+
+# List of supported language codes
+supported_languages = {
+    "ar":"Arabic",
+    "pt":"Brazilian Portuguese",
+    "zh-cn":"Chinese",
+    "cs":"Czech",
+    "nl":"Dutch",
+    "en":"English",
+    "fr":"French",
+    "de":"German",
+    "it":"Italian",
+    "pl":"Polish",
+    "ru":"Russian",
+    "es":"Spanish",
+    "tr":"Turkish",
+    "ja":"Japanese",
+    "ko":"Korean",
+    "hu":"Hungarian",
+    "hi":"Hindi"
+}
+
+default_tts_settings = {
+    "temperature" : 0.75,
+    "length_penalty" : 1.0,
+    "repetition_penalty": 5.0,
+    "top_k" : 50,
+    "top_p" : 0.85,
+    "speed" : 1,
+    "enable_text_splitting": True
+}
+
+official_model_list = ["v2.0.0","v2.0.1","v2.0.2","v2.0.3","main"]
+official_model_list_v2 = ["2.0.0","2.0.1","2.0.2","2.0.3"]
+
+reversed_supported_languages = {name: code for code, name in supported_languages.items()}
+
+class TTSWrapper:
+    def __init__(self,output_folder = "./output", speaker_folder="./speakers",model_folder="./xtts_folder",lowvram = False,model_source = "local",model_version = "2.0.2",device = "cuda",deepspeed = False,enable_cache_results = True):
+
+        self.cuda = device # If the user has chosen what to use, we rewrite the value to the value we want to use
+        self.device = 'cpu' if lowvram else (self.cuda if torch.cuda.is_available() else "cpu")
+        self.lowvram = lowvram  # Store whether we want to run in low VRAM mode.
+
+        self.latents_cache = {} 
+
+        self.model_source = model_source
+        self.model_version = model_version
+        self.tts_settings = default_tts_settings
+        self.stream_chunk_size = 100
+
+        self.deepspeed = deepspeed
+
+        self.speaker_folder = speaker_folder
+        self.output_folder = output_folder
+        self.model_folder = model_folder
+
+        self.create_directories()
+        check_tts_version()
+
+        self.enable_cache_results = enable_cache_results
+        self.cache_file_path = os.path.join(output_folder, "cache.json")
+
+        self.is_official_model = True
+        
+        if self.enable_cache_results:
+            # Reset the contents of the cache file at each initialization.
+            with open(self.cache_file_path, 'w') as cache_file:
+                json.dump({}, cache_file)
+    # HELP FUNC
+    def isModelOfficial(self,model_version):
+        if model_version in official_model_list:
+            self.is_official_model = True
+            return True
+        return False
+
+    def check_model_version_old_format(self,model_version):
+        if model_version in official_model_list_v2:
+            return "v"+model_version
+        return model_version
+
+    def get_models_list(self):
+        # Fetch all entries in the directory given by self.model_folder
+        entries = os.listdir(self.model_folder)
+        
+        # Filter out and return only directories
+        return [name for name in entries if os.path.isdir(os.path.join(self.model_folder, name))]
+        
+
+    def get_wav_header(self, channels:int=1, sample_rate:int=24000, width:int=2) -> bytes:
+        wav_buf = io.BytesIO()
+        with wave.open(wav_buf, "wb") as out:
+            out.setnchannels(channels)
+            out.setsampwidth(width)
+            out.setframerate(sample_rate)
+            out.writeframes(b"")
+        wav_buf.seek(0)
+        return wav_buf.read()
+
+    # CACHE FUNCS
+    def check_cache(self, text_params):
+        if not self.enable_cache_results:
+            return None
+
+        try:
+            with open(self.cache_file_path) as cache_file:
+                cache_data = json.load(cache_file)
+
+            for entry in cache_data.values():
+                if all(entry[key] == value for key, value in text_params.items()):
+                    return entry['file_name']
+
+            return None
+
+        except FileNotFoundError:
+            return None
+
+    def update_cache(self, text_params, file_name):
+        if not self.enable_cache_results:
+            return None
+        try:
+            # Check if the file exists and its contents before downloading.
+            if os.path.exists(self.cache_file_path) and os.path.getsize(self.cache_file_path) > 0:
+                with open(self.cache_file_path, 'r') as cache_file:
+                    cache_data = json.load(cache_file)
+            else:
+                cache_data = {}  # Initialization of an empty dictionary if the file does not exist or is empty.
+
+            timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+            cache_data[timestamp] = {**text_params, 'file_name': file_name}
+
+            with open(self.cache_file_path, 'w') as cache_file:
+                json.dump(cache_data, cache_file)
+
+            logger.info("Cache updated successfully.")
+        except IOError as e:
+            print("I/O error occurred while updating the cache: ", str(e))
+        except json.JSONDecodeError as e:
+            print("JSON decode error occurred while updating the cache: ", str(e))
+            
+    # LOAD FUNCS
+    def load_model(self,load=True):
+        if self.model_source == "api":
+            self.model = TTS("tts_models/multilingual/multi-dataset/xtts_v2")
+
+        if self.model_source == "apiManual":
+            this_dir = Path(self.model_folder)
+
+            if self.isModelOfficial(self.model_version):
+              download_model(this_dir,self.model_version)
+
+            config_path = this_dir / f'{self.model_version}' / 'config.json'
+            checkpoint_dir = this_dir / f'{self.model_version}'
+
+            self.model = TTS(model_path=checkpoint_dir,config_path=config_path).to(self.device)
+
+        if self.model_source != "api" and self.model_source != "apiManual":
+           is_official_model = False
+ 
+           self.load_local_model(load = is_official_model)
+           if self.lowvram == False:
+             # Due to the fact that we create latents on the cpu and load them from the cuda we get an error
+             logger.info("Pre-create latents for all current speakers")
+             self.create_latents_for_all() 
+          
+        logger.info("Model successfully loaded ")
+    
+    def load_local_model(self,load=True):
+        this_model_dir = Path(self.model_folder)
+
+        if self.isModelOfficial(self.model_version):
+            download_model(this_model_dir,self.model_version)
+            this_model_dir = this_model_dir
+
+        config = XttsConfig()
+        config_path = this_model_dir /  f'{self.model_version}' / 'config.json'
+        checkpoint_dir = this_model_dir / f'{self.model_version}'
+
+        config.load_json(str(config_path))
+        
+        self.model = Xtts.init_from_config(config)
+        self.model.load_checkpoint(config,use_deepspeed=self.deepspeed, checkpoint_dir=str(checkpoint_dir))
+        self.model.to(self.device)
+
+    def switch_model(self,model_name):
+
+        model_list = self.get_models_list()
+        # Check to see if the same name is selected
+        if(model_name == self.model_version):
+            raise InvalidSettingsError("The model with this name is already loaded in memory")
+            return
+        
+        # Check if the model is in the list at all
+        if(model_name not in model_list):
+            raise InvalidSettingsError(f"A model with `{model_name}` name is not in the models folder, the current available models: {model_list}")
+            return
+
+        # Clear gpu cache from old model
+        self.model = ""
+        torch.cuda.empty_cache()
+        logger.info("Model successfully unloaded from memory")
+        
+        # Start load model
+        logger.info(f"Start loading {model_name} model")
+        self.model_version = model_name
+        if self.model_source == "local":
+          self.load_local_model()
+        else:
+          self.load_model()
+          
+        logger.info(f"Model successfully loaded")
+
+    # LOWVRAM FUNCS
+    def switch_model_device(self):
+        # We check for lowram and the existence of cuda
+        if self.lowvram and torch.cuda.is_available() and self.cuda != "cpu":
+            with torch.no_grad():
+                if self.device == self.cuda:
+                    self.device = "cpu"
+                else:
+                    self.device = self.cuda
+
+                self.model.to(self.device)
+
+            if self.device == 'cpu':
+                # Clearing the cache to free up VRAM
+                torch.cuda.empty_cache()
+
+    # SPEAKER FUNCS
+    def get_or_create_latents(self, speaker_name, speaker_wav):
+        if speaker_name not in self.latents_cache:
+            logger.info(f"creating latents for {speaker_name}: {speaker_wav}")
+            gpt_cond_latent, speaker_embedding = self.model.get_conditioning_latents(speaker_wav)
+            self.latents_cache[speaker_name] = (gpt_cond_latent, speaker_embedding)
+        return self.latents_cache[speaker_name]
+
+    def create_latents_for_all(self):
+        speakers_list = self._get_speakers()
+
+        for speaker in speakers_list:
+            self.get_or_create_latents(speaker['speaker_name'],speaker['speaker_wav'])
+
+        logger.info(f"Latents created for all {len(speakers_list)} speakers.")
+
+    # DIRICTORIES FUNCS
+    def create_directories(self):
+        directories = [self.output_folder, self.speaker_folder,self.model_folder]
+
+        for sanctuary in directories:
+            # List of folders to be checked for existence
+            absolute_path = os.path.abspath(os.path.normpath(sanctuary))
+
+            if not os.path.exists(absolute_path):
+                # If the folder does not exist, create it
+                os.makedirs(absolute_path)
+                logger.info(f"Folder in the path {absolute_path} has been created")
+
+    def set_speaker_folder(self, folder):
+        if os.path.exists(folder) and os.path.isdir(folder):
+            self.speaker_folder = folder
+            self.create_directories()
+            logger.info(f"Speaker folder is set to {folder}")
+        else:
+            raise ValueError("Provided path is not a valid directory")
+
+    def set_out_folder(self, folder):
+        if os.path.exists(folder) and os.path.isdir(folder):
+            self.output_folder = folder
+            self.create_directories()
+            logger.info(f"Output folder is set to {folder}")
+        else:
+            raise ValueError("Provided path is not a valid directory")
+
+    def set_tts_settings(self, temperature, speed, length_penalty,
+                         repetition_penalty, top_p, top_k, enable_text_splitting, stream_chunk_size):
+        # Validate each parameter and raise an exception if any checks fail.
+        
+        # Check temperature
+        if not (0.01 <= temperature <= 1):
+            raise InvalidSettingsError("Temperature must be between 0.01 and 1.")
+        
+        # Check speed
+        if not (0.2 <= speed <= 2):
+            raise InvalidSettingsError("Speed must be between 0.2 and 2.")
+        
+        # Check length_penalty (no explicit range specified)
+        if not isinstance(length_penalty, float):
+            raise InvalidSettingsError("Length penalty must be a floating point number.")
+        
+        # Check repetition_penalty
+        if not (0.1 <= repetition_penalty <= 10.0):
+            raise InvalidSettingsError("Repetition penalty must be between 0.1 and 10.0.")
+        
+        # Check top_p
+        if not (0.01 <= top_p <= 1):
+            raise InvalidSettingsError("Top_p must be between 0.01 and 1 and must be a float.")
+        
+        # Check top_k
+        if not (1 <= top_k <= 100):
+            raise InvalidSettingsError("Top_k must be an integer between 1 and 100.")
+
+        # Check stream_chunk_size
+        if not (20 <= stream_chunk_size <= 400):
+            raise InvalidSettingsError("Stream chunk size must be an integer between 20 and 400.")
+        
+        # Check enable_text_splitting
+        if not isinstance(enable_text_splitting, bool):
+            raise InvalidSettingsError("Enable text splitting must be either True or False.")
+        
+        # All validations passed - proceed to apply settings.
+        self.tts_settings = {
+            "temperature": temperature,
+            "speed": speed,
+            "length_penalty": length_penalty,
+            "repetition_penalty": repetition_penalty,
+            "top_p": top_p,
+            "top_k": top_k,
+            "enable_text_splitting": enable_text_splitting,
+        }
+
+        self.stream_chunk_size = stream_chunk_size
+
+        print("Successfully updated TTS settings.")
+
+    # GET FUNCS
+    def get_wav_files(self, directory):
+        """ Finds all the wav files in a directory. """
+        wav_files = [f for f in os.listdir(directory) if f.endswith('.wav')]
+        return wav_files
+
+    def _get_speakers(self):
+        """
+        Gets info on all the speakers.
+
+        Returns a list of {speaker_name,speaker_wav,preview} dicts
+        """
+        speakers = []
+        for f in os.listdir(self.speaker_folder):
+            full_path = os.path.join(self.speaker_folder,f)
+            if os.path.isdir(full_path):
+                # multi-sample voice
+                subdir_files = self.get_wav_files(full_path) 
+                if len(subdir_files) == 0:
+                    # no wav files in directory
+                    continue
+
+                speaker_name = f
+                speaker_wav = [os.path.join(self.speaker_folder,f,s) for s in subdir_files]
+                # use the first file found as the preview
+                preview = os.path.join(f,subdir_files[0])
+                speakers.append({
+                        'speaker_name': speaker_name,
+                        'speaker_wav': speaker_wav,
+                        'preview': preview
+                        })
+
+            elif f.endswith('.wav'):
+                speaker_name = os.path.splitext(f)[0]
+                speaker_wav = full_path 
+                preview = f
+                speakers.append({
+                        'speaker_name': speaker_name,
+                        'speaker_wav': speaker_wav,
+                        'preview': preview
+                        })
+        return speakers
+
+    def get_speakers(self):
+        """ Gets available speakers """
+        speakers = [ s['speaker_name'] for s in self._get_speakers() ] 
+        return speakers
+
+    def get_local_ip(self):
+      try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(('10.255.255.255', 1))
+            IP = s.getsockname()[0] 
+      except Exception as e:
+        print(f"Failed to obtain a local IP: {e}")
+        return None
+      return IP
+
+    # Special format for SillyTavern
+    def get_speakers_special(self):
+        BASE_URL = os.getenv('BASE_URL', '127.0.0.1:6006')
+        BASE_HOST = os.getenv('BASE_HOST', '127.0.0.1')
+        BASE_PORT = os.getenv('BASE_PORT', '6006')
+        TUNNEL_URL = os.getenv('TUNNEL_URL', '')
+
+        is_local_host = BASE_HOST == '127.0.0.1' or BASE_HOST == "localhost"
+
+        if TUNNEL_URL == "" and not is_local_host:
+            TUNNEL_URL = f"http://{self.get_local_ip()}:{BASE_PORT}"
+        speakers_special = []
+
+        speakers = self._get_speakers()
+
+        for speaker in speakers:
+            if TUNNEL_URL == "":
+                preview_url = f"{BASE_URL}/sample/{speaker['preview']}"
+            else:
+                preview_url = f"{TUNNEL_URL}/sample/{speaker['preview']}"
+
+            speaker_special = {
+                    'name': speaker['speaker_name'],
+                    'voice_id': speaker['speaker_name'],
+                    'preview_url': preview_url
+            }
+            speakers_special.append(speaker_special)
+
+        return speakers_special
+
+
+    def list_languages(self):
+        return reversed_supported_languages
+
+    # GENERATION FUNCS
+    def clean_text(self,text):
+        # Remove asterisks and line breaks
+        text = re.sub(r'[\*\r\n]', '', text)
+        # Replace double quotes with single quotes and correct punctuation around quotes
+        text = re.sub(r'"\s?(.*?)\s?"', r"'\1'", text)
+        return text
+
+    async def stream_generation(self,text,speaker_name,speaker_wav,language,output_file):
+        # Log time
+        generate_start_time = time.time()  # Record the start time of loading the model
+
+        gpt_cond_latent, speaker_embedding = self.get_or_create_latents(speaker_name, speaker_wav)
+        file_chunks = []
+
+        chunks = self.model.inference_stream(
+            text,
+            language,
+            speaker_embedding=speaker_embedding,
+            gpt_cond_latent=gpt_cond_latent,
+            **self.tts_settings, # Expands the object with the settings and applies them for generation
+            stream_chunk_size=self.stream_chunk_size,
+        )
+        
+        for chunk in chunks:
+            if isinstance(chunk, list):
+                chunk = torch.cat(chunk, dim=0)
+            file_chunks.append(chunk)
+            chunk = chunk.cpu().numpy()
+            chunk = chunk[None, : int(chunk.shape[0])]
+            chunk = np.clip(chunk, -1, 1)
+            chunk = (chunk * 32767).astype(np.int16)
+            yield chunk.tobytes()
+
+        if len(file_chunks) > 0:
+            wav = torch.cat(file_chunks, dim=0)
+            torchaudio.save(output_file, wav.cpu().squeeze().unsqueeze(0), 24000)
+        else:
+            logger.warning("No audio generated.")
+
+        generate_end_time = time.time()  # Record the time to generate TTS
+        generate_elapsed_time = generate_end_time - generate_start_time
+
+        logger.info(f"Processing time: {generate_elapsed_time:.2f} seconds.")
+
+    def local_generation(self,text,speaker_name,speaker_wav,language,output_file):
+        # Log time
+        generate_start_time = time.time()  # Record the start time of loading the model
+
+        gpt_cond_latent, speaker_embedding = self.get_or_create_latents(speaker_name, speaker_wav)
+
+        out = self.model.inference(
+            text,
+            language,
+            gpt_cond_latent=gpt_cond_latent,
+            speaker_embedding=speaker_embedding,
+            **self.tts_settings, # Expands the object with the settings and applies them for generation
+        )
+
+        torchaudio.save(output_file, torch.tensor(out["wav"]).unsqueeze(0), 24000)
+
+        generate_end_time = time.time()  # Record the time to generate TTS
+        generate_elapsed_time = generate_end_time - generate_start_time
+
+        logger.info(f"Processing time: {generate_elapsed_time:.2f} seconds.")
+
+    def api_generation(self,text,speaker_wav,language,output_file):
+        self.model.tts_to_file(
+                text=text,
+                speaker_wav=speaker_wav,
+                language=language,
+                file_path=output_file,
+        )
+
+    def get_speaker_wav(self, speaker_name_or_path): 
+        """ Gets the speaker_wav(s) for a given speaker name. """
+        if speaker_name_or_path.endswith('.wav'):
+            # it's a file name
+            if os.path.isabs(speaker_name_or_path):
+                # absolute path; nothing to do
+                speaker_wav = speaker_name_or_path
+            else:
+                # make it a full path
+                speaker_wav = os.path.join(self.speaker_folder, speaker_name_or_path)
+        else:
+            # it's a speaker name
+            full_path = os.path.join(self.speaker_folder, speaker_name_or_path) 
+            wav_file = f"{full_path}.wav"
+            if os.path.isdir(full_path):
+                # multi-sample speaker
+                speaker_wav = [ os.path.join(full_path,wav) for wav in self.get_wav_files(full_path) ]
+                if len(speaker_wav) == 0:
+                    raise ValueError(f"no wav files found in {full_path}")
+            elif os.path.isfile(wav_file):
+                speaker_wav = wav_file
+            else:
+                raise ValueError(f"Speaker {speaker_name_or_path} not found.")
+
+        return speaker_wav
+
+
+    # MAIN FUNC
+    def process_tts_to_file(self, text, speaker_name_or_path, language, file_name_or_path="out.wav", stream=False):
+        try:
+            speaker_wav = self.get_speaker_wav(speaker_name_or_path)
+            # Determine output path based on whether a full path or a file name was provided
+            if os.path.isabs(file_name_or_path):
+                # An absolute path was provided by user; use as is.
+                output_file = file_name_or_path
+            else:
+                # Only a filename was provided; prepend with output folder.
+                output_file = os.path.join(self.output_folder, file_name_or_path)
+
+            # Check if 'text' is a valid path to a '.txt' file.
+            if os.path.isfile(text) and text.lower().endswith('.txt'):
+                with open(text, 'r', encoding='utf-8') as f:
+                    text = f.read()
+
+            # Generate unic name for cached result
+            if self.enable_cache_results:
+                timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+                file_name_or_path = timestamp + "_cache_" + file_name_or_path
+                output_file = os.path.join(self.output_folder, file_name_or_path)
+
+            # Replace double quotes with single, asterisks, carriage returns, and line feeds
+            clear_text = self.clean_text(text)
+
+            # Generate a dictionary of the parameters to use for caching.
+            text_params = {
+              'text': clear_text,
+              'speaker_name_or_path': speaker_name_or_path,
+              'language': language
+            }
+
+            # Check if results are already cached.
+            cached_result = self.check_cache(text_params)
+
+            if cached_result is not None:
+                logger.info("Using cached result.")
+                return cached_result  # Return the path to the cached result.
+
+            self.switch_model_device() # Load to CUDA if lowram ON
+
+            # Define generation if model via api or locally
+            if self.model_source == "local":
+                if stream:
+                    async def stream_fn():
+                        async for chunk in self.stream_generation(clear_text,speaker_name_or_path,speaker_wav,language,output_file):
+                            yield chunk
+                        self.switch_model_device()
+                        # After generation completes successfully...
+                        self.update_cache(text_params,output_file)
+                    return stream_fn()
+                else:
+                    self.local_generation(clear_text,speaker_name_or_path,speaker_wav,language,output_file)
+            else:
+                self.api_generation(clear_text,speaker_wav,language,output_file)
+            
+            self.switch_model_device() # Unload to CPU if lowram ON
+
+            # After generation completes successfully...
+            self.update_cache(text_params,output_file)
+            return output_file
+
+        except Exception as e:
+            raise e  # Propagate exceptions for endpoint handling.
+
+        
+
+
+
+        
+</"file: xtts_api_server\tts_funcs.py">
+
+<"file: xtts_api_server\server.py">from TTS.api import TTS
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse,StreamingResponse
+
+from pydantic import BaseModel
+import uvicorn
+
+import os
+import time
+from pathlib import Path
+import shutil
+from loguru import logger
+from argparse import ArgumentParser
+from pathlib import Path
+from uuid import uuid4
+
+from xtts_api_server.tts_funcs import TTSWrapper,supported_languages,InvalidSettingsError
+from xtts_api_server.RealtimeTTS import TextToAudioStream, CoquiEngine
+from xtts_api_server.modeldownloader import check_stream2sentence_version,install_deepspeed_based_on_python_version
+
+# Default Folders , you can change them via API
+DEVICE = os.getenv('DEVICE',"cuda")
+OUTPUT_FOLDER = os.getenv('OUTPUT', 'output')
+SPEAKER_FOLDER = os.getenv('SPEAKER', 'speakers')
+MODEL_FOLDER = os.getenv('MODEL', 'models')
+BASE_HOST = os.getenv('BASE_URL', '127.0.0.1:6006')
+BASE_URL = os.getenv('BASE_URL', '127.0.0.1:6006')
+MODEL_SOURCE = os.getenv("MODEL_SOURCE", "local")
+MODEL_VERSION = os.getenv("MODEL_VERSION","v2.0.2")
+LOWVRAM_MODE = os.getenv("LOWVRAM_MODE") == 'true'
+DEEPSPEED = os.getenv("DEEPSPEED") == 'true'
+USE_CACHE = os.getenv("USE_CACHE") == 'true'
+
+# STREAMING VARS
+STREAM_MODE = os.getenv("STREAM_MODE") == 'true'
+STREAM_MODE_IMPROVE = os.getenv("STREAM_MODE_IMPROVE") == 'true'
+STREAM_PLAY_SYNC = os.getenv("STREAM_PLAY_SYNC") == 'true'
+
+if(DEEPSPEED):
+  install_deepspeed_based_on_python_version()
+
+# Create an instance of the TTSWrapper class and server
+app = FastAPI()
+XTTS = TTSWrapper(OUTPUT_FOLDER,SPEAKER_FOLDER,MODEL_FOLDER,LOWVRAM_MODE,MODEL_SOURCE,MODEL_VERSION,DEVICE,DEEPSPEED,USE_CACHE)
+
+# Check for old format model version
+XTTS.model_version = XTTS.check_model_version_old_format(MODEL_VERSION)
+MODEL_VERSION = XTTS.model_version
+
+# Create version string
+version_string = ""
+if MODEL_SOURCE == "api" or MODEL_VERSION == "main":
+    version_string = "lastest"
+else:
+    version_string = MODEL_VERSION
+
+# Load model
+if STREAM_MODE or STREAM_MODE_IMPROVE:
+    # Load model for Streaming
+    check_stream2sentence_version()
+
+    logger.warning("'Streaming Mode' has certain limitations, you can read about them here https://github.com/daswer123/xtts-api-server#about-streaming-mode")
+
+    if STREAM_MODE_IMPROVE:
+        logger.info("You launched an improved version of streaming, this version features an improved tokenizer and more context when processing sentences, which can be good for complex languages like Chinese")
+        
+    model_path = XTTS.model_folder
+    
+    engine = CoquiEngine(specific_model=MODEL_VERSION,use_deepspeed=DEEPSPEED,local_models_path=str(model_path))
+    stream = TextToAudioStream(engine)
+else:
+  logger.info(f"Model: '{version_string}' starts to load,wait until it loads")
+  XTTS.load_model() 
+
+if USE_CACHE:
+    logger.info("You have enabled caching, this option enables caching of results, your results will be saved and if there is a repeat request, you will get a file instead of generation")
+
+# Add CORS middleware 
+origins = ["*"]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# Help funcs
+def play_stream(stream,language):
+  if STREAM_MODE_IMPROVE:
+    # Here we define common arguments in a dictionary for DRY principle
+    play_args = {
+        'minimum_sentence_length': 2,
+        'minimum_first_fragment_length': 2,
+        'tokenizer': "stanza",
+        'language': language,
+        'context_size': 2
+    }
+    if STREAM_PLAY_SYNC:
+        # Play synchronously
+        stream.play(**play_args)
+    else:
+        # Play asynchronously
+        stream.play_async(**play_args)
+  else:
+    # If not improve mode just call the appropriate method based on sync_play flag.
+    if STREAM_PLAY_SYNC:
+      stream.play()
+    else:
+      stream.play_async()
+
+class OutputFolderRequest(BaseModel):
+    output_folder: str
+
+class SpeakerFolderRequest(BaseModel):
+    speaker_folder: str
+
+class ModelNameRequest(BaseModel):
+    model_name: str
+
+class TTSSettingsRequest(BaseModel):
+    stream_chunk_size: int
+    temperature: float
+    speed: float
+    length_penalty: float
+    repetition_penalty: float
+    top_p: float
+    top_k: int
+    enable_text_splitting: bool
+
+class SynthesisRequest(BaseModel):
+    text: str
+    speaker_wav: str 
+    language: str
+
+class SynthesisFileRequest(BaseModel):
+    text: str
+    speaker_wav: str 
+    language: str
+    file_name_or_path: str  
+
+@app.get("/speakers_list")
+def get_speakers():
+    speakers = XTTS.get_speakers()
+    return speakers
+
+@app.get("/speakers")
+def get_speakers():
+    speakers = XTTS.get_speakers_special()
+    return speakers
+
+@app.get("/languages")
+def get_languages():
+    languages = XTTS.list_languages()
+    return {"languages": languages}
+
+@app.get("/get_folders")
+def get_folders():
+    speaker_folder = XTTS.speaker_folder
+    output_folder = XTTS.output_folder
+    model_folder = XTTS.model_folder
+    return {"speaker_folder": speaker_folder, "output_folder": output_folder,"model_folder":model_folder}
+
+@app.get("/get_models_list")
+def get_models_list():
+    return XTTS.get_models_list()
+
+@app.get("/get_tts_settings")
+def get_tts_settings():
+    settings = {**XTTS.tts_settings,"stream_chunk_size":XTTS.stream_chunk_size}
+    return settings
+
+@app.get("/sample/{file_name:path}")
+def get_sample(file_name: str):
+    # A fix for path traversal vulenerability. 
+    # An attacker may summon this endpoint with ../../etc/passwd and recover the password file of your PC (in linux) or access any other file on the PC
+    if ".." in file_name:
+        raise HTTPException(status_code=404, detail=".. in the file name! Are you kidding me?") 
+    file_path = os.path.join(XTTS.speaker_folder, file_name)
+    if os.path.isfile(file_path):
+        return FileResponse(file_path, media_type="audio/wav")
+    else:
+        logger.error("File not found")
+        raise HTTPException(status_code=404, detail="File not found")
+
+@app.post("/set_output")
+def set_output(output_req: OutputFolderRequest):
+    try:
+        XTTS.set_out_folder(output_req.output_folder)
+        return {"message": f"Output folder set to {output_req.output_folder}"}
+    except ValueError as e:
+        logger.error(e)
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/set_speaker_folder")
+def set_speaker_folder(speaker_req: SpeakerFolderRequest):
+    try:
+        XTTS.set_speaker_folder(speaker_req.speaker_folder)
+        return {"message": f"Speaker folder set to {speaker_req.speaker_folder}"}
+    except ValueError as e:
+        logger.error(e)
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/switch_model")
+def switch_model(modelReq: ModelNameRequest):
+    try:
+        XTTS.switch_model(modelReq.model_name)
+        return {"message": f"Model switched to {modelReq.model_name}"}
+    except InvalidSettingsError as e:  
+        logger.error(e)
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/set_tts_settings")
+def set_tts_settings_endpoint(tts_settings_req: TTSSettingsRequest):
+    try:
+        XTTS.set_tts_settings(**tts_settings_req.dict())
+        return {"message": "Settings successfully applied"}
+    except InvalidSettingsError as e: 
+        logger.error(e)
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/tts_to_audio/")
+async def tts_to_audio(request: SynthesisRequest):
+    try:
+        # Validate language code against supported languages.
+        if request.language.lower() not in supported_languages:
+            raise HTTPException(status_code=400,
+                                detail="Language code sent is either unsupported or misspelled.")
+
+        async def generator():
+            chunks = XTTS.process_tts_to_file(
+                text=request.text,
+                speaker_name_or_path=request.speaker_wav,
+                language=request.language.lower(),
+                stream=True,
+            )
+            # Write file header to the output stream.
+            yield XTTS.get_wav_header()
+            async for chunk in chunks:
+                yield chunk
+
+        return StreamingResponse(generator(), media_type='audio/x-wav')
+
+    except Exception as e:
+        logger.error(e)
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
+@app.post("/tts_to_file")
+async def tts_to_file(request: SynthesisFileRequest):
+    try:
+        # Validate language code against supported languages.
+        if request.language.lower() not in supported_languages:
+            raise HTTPException(status_code=400,
+                                detail="Language code sent is either unsupported or misspelled.")
+
+        async def generator():
+            chunks = XTTS.process_tts_to_file(
+                text=request.text,
+                speaker_name_or_path=request.speaker_wav,
+                language=request.language.lower(),
+                stream=True,
+            )
+            # Write file header to the output stream.
+            yield XTTS.get_wav_header()
+            async for chunk in chunks:
+                yield chunk
+
+        return StreamingResponse(generator(), media_type='audio/x-wav')
+
+    except Exception as e:
+        logger.error(e)
+        raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
+
+if __name__ == "__main__":
+    uvicorn.run(app,host="0.0.0.0",port=8002)
+</"file: xtts_api_server\server.py">
+
+<"file: xtts_api_server\__main__.py">import uvicorn
+from argparse import ArgumentParser
+import os
+
+parser = ArgumentParser(description="Run the Uvicorn server.")
+parser.add_argument("-hs", "--host", default="localhost", help="Host to bind")
+parser.add_argument("-p", "--port", default=6006, type=int, help="Port to bind")
+parser.add_argument("-d", "--device", default="cuda", type=str, help="Device that will be used, you can choose cpu or cuda")
+parser.add_argument("-sf", "--speaker-folder", default="speakers/", type=str, help="The folder where you get the samples for tts")
+parser.add_argument("-o", "--output", default="output/", type=str, help="Output folder")
+parser.add_argument("-t", "--tunnel", default="", type=str, help="URL of tunnel used (e.g: ngrok, localtunnel)")
+parser.add_argument("-mf", "--model-folder", default="xtts_models/", type=str, help="The place where models for XTTS will be stored, finetuned models should be stored in this folder.")
+parser.add_argument("-ms", "--model-source", default="local", choices=["api","apiManual", "local"],
+                    help="Define the model source: 'api' for latest version from repository, apiManual for 2.0.2 model and api inference or 'local' for using local inference and model v2.0.2.")
+parser.add_argument("-v", "--version", default="v2.0.2", type=str, help="You can specify which version of xtts to use or specify your own model, just upload model folder in models folder ,This version will be used everywhere in local and apiManual.")
+parser.add_argument("--listen", action='store_true', help="Allows the server to be used outside the local computer, similar to -hs 0.0.0.0.0.")
+parser.add_argument("--lowvram", action='store_true', help="Enable low vram mode which switches the model to RAM when not actively processing.")
+parser.add_argument("--deepspeed", action='store_true', help="Enables deepspeed mode, speeds up processing by several times.")
+parser.add_argument("--use-cache", action='store_true', help="Enables caching of results, your results will be saved and if there will be a repeated request, you will get a file instead of generation.")
+parser.add_argument("--streaming-mode", action='store_true', help="Enables streaming mode, currently needs a lot of work.")
+parser.add_argument("--streaming-mode-improve", action='store_true', help="Includes an improved streaming mode that consumes 2gb more VRAM and uses a better tokenizer, good for languages such as Chinese")
+parser.add_argument("--stream-play-sync", action='store_true', help="Additional flag for streaming mod that allows you to play all audio one at a time without interruption")
+
+args = parser.parse_args()
+
+os.environ["LISTEN"] = str(args.listen).lower()
+host_ip = "0.0.0.0" if args.listen else args.host
+
+os.environ['DEVICE'] = args.device  # Set environment variable for output folder.
+os.environ['OUTPUT'] = args.output  # Set environment variable for output folder.
+os.environ['SPEAKER'] = args.speaker_folder  # Set environment variable for speaker folder.
+os.environ['MODEL'] = args.model_folder  # Set environment variable for model folder.
+os.environ['BASE_HOST'] = host_ip  # Set environment variable for base host."
+os.environ['BASE_PORT'] = str(args.port)  # Set environment variable for base port."
+os.environ['BASE_URL'] = "http://" + host_ip + ":" + str(args.port)  # Set environment variable for base url."
+os.environ['TUNNEL_URL'] = args.tunnel  # it is necessary to correctly return correct previews in list of speakers
+os.environ['MODEL_SOURCE'] = args.model_source  # Set environment variable for the model source
+os.environ["MODEL_VERSION"] = args.version # Specify version of XTTS model
+os.environ["USE_CACHE"] = str(args.use_cache).lower() # Enable caching results
+os.environ["DEEPSPEED"] = str(args.deepspeed).lower() # Enable deepspeed
+os.environ["LOWVRAM_MODE"] = str(args.lowvram).lower() # Set lowvram mode
+os.environ["STREAM_MODE"] = str(args.streaming_mode).lower() # Enable Streaming mode
+os.environ["STREAM_MODE_IMPROVE"] = str(args.streaming_mode_improve).lower() # Enable improved Streaming mode
+os.environ["STREAM_PLAY_SYNC"] = str(args.stream_play_sync).lower() # Enable Streaming mode
+
+from xtts_api_server.server import app
+
+uvicorn.run(app, host=host_ip, port=args.port)</"file: xtts_api_server\__main__.py">
+
+<"file: xtts_api_server\modeldownloader.py">import os
+import subprocess
+import sys
+import requests
+
+import importlib.metadata as metadata  # Use importlib.metadata
+from pathlib import Path
+from tqdm import tqdm
+
+from packaging import version
+from loguru import logger
+
+
+def create_directory_if_not_exists(directory):
+    if not directory.exists():
+        directory.mkdir(parents=True)
+
+def download_file(url, destination):
+    response = requests.get(url, stream=True)
+    total_size_in_bytes = int(response.headers.get('content-length', 0))
+    block_size = 1024  # 1 Kibibyte
+
+    progress_bar = tqdm(total=total_size_in_bytes, unit='iB', unit_scale=True)
+
+    with open(destination, 'wb') as file:
+        for data in response.iter_content(block_size):
+            progress_bar.update(len(data))
+            file.write(data)
+
+    progress_bar.close()
+
+def install_package(package_link):
+    subprocess.check_call([sys.executable, "-m", "pip", "install", package_link])
+
+def is_package_installed(package_name):
+    try:
+        metadata.version(package_name)
+        return True
+    except metadata.PackageNotFoundError:
+        return False
+
+def install_deepspeed_based_on_python_version():
+    # check_and_install_torch()
+    if not is_package_installed('deepspeed'):
+        python_version = sys.version_info
+
+        logger.info(f"Python version: {python_version.major}.{python_version.minor}")
+
+        # Define your package links here
+        py310_win = "https://github.com/daswer123/xtts-webui/releases/download/deepspeed/deepspeed-0.11.2+cuda118-cp310-cp310-win_amd64.whl"
+        py311_win = "https://github.com/daswer123/xtts-webui/releases/download/deepspeed/deepspeed-0.11.2+cuda118-cp311-cp311-win_amd64.whl"
+
+        # Use generic pip install deepspeed for Linux or custom wheels for Windows.
+        deepspeed_link = None
+
+        if sys.platform == 'win32':
+            if python_version.major == 3 and python_version.minor == 10:
+                deepspeed_link = py310_win
+
+            elif python_version.major == 3 and python_version.minor == 11:
+                deepspeed_link = py311_win
+
+            else:
+                logger.error("Unsupported Python version on Windows.")
+
+        else: # Assuming Linux/MacOS otherwise (add specific checks if necessary)
+             deepspeed_link = 'deepspeed'
+
+        if deepspeed_link:
+             logger.info("Installing DeepSpeed...")
+             install_package(deepspeed_link)
+
+    # else:
+        #  logger.info("'deepspeed' already installed.")
+
+def upgrade_tts_package():
+    try:
+        logger.warning("TTS version is outdated, attempting to upgrade TTS...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install","-q", "--force-reinstall","--no-deps", "tts==0.21.3"])
+        logger.info("TTS has been successfully upgraded ")
+    except Exception as e:
+        logger.error(f"An error occurred while upgrading TTS: {e}")
+        logger.info("Try installing the new version manually")
+        logger.info("pip install --upgrade tts")
+
+
+def upgrade_stream2sentence_package():
+    try:
+        logger.warning("Stream2sentence version is outdated, attempting to upgrade stream2sentence...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install","-q", "--upgrade", "stream2sentence"])
+        logger.info("Stream2sentence has been successfully upgraded ")
+    except Exception as e:
+        logger.error(f"An error occurred while upgrading Stream2sentence: {e}")
+        logger.info("Stream2sentence installing the new version manually")
+        logger.info("pip install --upgrade stream2sentence")
+
+def check_tts_version():
+    try:
+        tts_version = metadata.version("tts")
+        # print(f"[XTTS] TTS version: {tts_version}")
+
+        if version.parse(tts_version) != version.parse("0.21.3"):
+            upgrade_tts_package()
+            # print("[XTTS] TTS version is too old. Please upgrade to version 0.21.2 or later.")
+            # print("[XTTS] pip install --upgrade tts")
+        # else:
+            # logger.info("TTS version is up to date.")
+    except metadata.PackageNotFoundError:
+        print("TTS is not installed.")
+
+
+def check_stream2sentence_version():
+    try:
+        tts_version = metadata.version("stream2sentence")
+        if version.parse(tts_version) < version.parse("0.2.2"):
+            upgrade_stream2sentence_package()
+    except metadata.PackageNotFoundError:
+        print("stream2sentence is not installed.")
+
+def download_model(this_dir,model_version):
+    # Define paths
+    base_path = this_dir
+    model_path = base_path / f'{model_version}'
+
+    # Define files and their corresponding URLs
+    files_to_download = {
+         "config.json": f"https://huggingface.co/coqui/XTTS-v2/raw/{model_version}/config.json",
+         "model.pth": f"https://huggingface.co/coqui/XTTS-v2/resolve/{model_version}/model.pth?download=true",
+         "vocab.json": f"https://huggingface.co/coqui/XTTS-v2/raw/{model_version}/vocab.json",
+         "speakers_xtts.pth": "https://huggingface.co/coqui/XTTS-v2/resolve/main/speakers_xtts.pth?download=true"
+    }
+
+    # Check and create directories
+    create_directory_if_not_exists(base_path)
+    create_directory_if_not_exists(model_path)
+
+    # Download files if they don't exist
+    for filename, url in files_to_download.items():
+         destination = model_path / filename
+         if not destination.exists():
+             print(f"[XTTS] Downloading {filename}...")
+             download_file(url, destination)
+
+# if __name__ == "__main__":
+#    this_dir = Path(__file__).parent.resolve()
+#    main_downloader(this_dir)</"file: xtts_api_server\modeldownloader.py">
+
+<"file: xtts_api_server\__init__.py"></"file: xtts_api_server\__init__.py">
+
+<"file: xtts_api_server\RealtimeTTS\text_to_stream.py">from .threadsafe_generators import CharIterator, AccumulatingThreadSafeGenerator
+from .stream_player import StreamPlayer, AudioConfiguration
+from typing import Union, Iterator, List
+from .engines import BaseEngine
+import stream2sentence as s2s
+import numpy as np
+import threading
+import traceback
+import logging
+import pyaudio
+import queue
+import time
+import wave
+
+class TextToAudioStream:
+
+    def __init__(self, 
+                 engine: Union[BaseEngine, List[BaseEngine]],
+                 log_characters: bool = False,
+                 on_text_stream_start=None,
+                 on_text_stream_stop=None,
+                 on_audio_stream_start=None,
+                 on_audio_stream_stop=None,
+                 on_character=None,
+                 tokenizer: str = "nltk",
+                 language: str = "en",
+                 level=logging.WARNING,
+                 ):
+        """
+        Initializes the TextToAudioStream.
+
+        Args:
+            engine (BaseEngine): The engine used for text to audio synthesis.
+            log_characters (bool, optional): If True, logs the characters processed for synthesis.
+            on_text_stream_start (callable, optional): Callback function that gets called when the text stream starts.
+            on_text_stream_stop (callable, optional): Callback function that gets called when the text stream stops.
+            on_audio_stream_start (callable, optional): Callback function that gets called when the audio stream starts.
+            on_audio_stream_stop (callable, optional): Callback function that gets called when the audio stream stops.
+            on_character (callable, optional): Callback function that gets called when a single character is processed.
+            level (int, optional): Logging level. Defaults to logging.WARNING.
+        """
+
+        # Initialize the logging configuration with the specified level
+        logging.basicConfig(format='RealTimeTTS: %(message)s', level=level)
+
+        logging.info(f"Starting RealTimeTTS")
+
+        self.log_characters = log_characters
+        self.on_text_stream_start = on_text_stream_start
+        self.on_text_stream_stop = on_text_stream_stop
+        self.on_audio_stream_start = on_audio_stream_start
+        self.on_audio_stream_stop = on_audio_stream_stop
+        self.output_wavfile = None
+        self.chunk_callback = None
+        self.wf = None
+        self.abort_events = []
+        self.tokenizer = tokenizer
+        self.language = language
+        self.player = None
+
+        self._create_iterators()
+
+        logging.info(f"Initializing tokenizer {tokenizer} for language {language}")
+        s2s.init_tokenizer(tokenizer, language)
+        
+        # Initialize the play_thread attribute (used for playing audio in a separate thread)
+        self.play_thread = None
+
+        # Initialize an attribute to store generated text
+        self.generated_text = ""
+
+        # A flag to indicate if the audio stream is currently running or not
+        self.stream_running = False
+
+        self.on_character = on_character
+
+        self.engine_index = 0
+        if isinstance(engine, list):
+            # Handle the case where engine is a list of BaseEngine instances
+            self.engines = engine
+        else:
+            # Handle the case where engine is a single BaseEngine instance
+            self.engines = [engine]        
+
+        self.load_engine(self.engines[self.engine_index])
+
+
+    def load_engine(self, 
+             engine: BaseEngine):
+        """
+        Loads the synthesis engine and prepares the audio player for stream playback.
+        This method sets up the engine that will be used for text-to-audio conversion, extracts the necessary stream information like format, channels, and rate from the engine, and initializes the StreamPlayer if the engine does not support consuming generators directly.
+
+        Args:
+            engine (BaseEngine): The synthesis engine to be used for converting text to audio.
+        """
+
+        # Store the engine instance (responsible for text-to-audio conversion)
+        self.engine = engine
+
+        # Extract stream information (format, channels, rate) from the engine
+        format, channels, rate = self.engine.get_stream_info()
+
+        # Check if the engine doesn't support consuming generators directly
+        if not self.engine.can_consume_generators:
+            self.player = StreamPlayer(self.engine.queue, AudioConfiguration(format, channels, rate), on_playback_start=self._on_audio_stream_start)
+        else:
+            self.engine.on_playback_start = self._on_audio_stream_start
+            self.player = None
+
+        logging.info(f"loaded engine {self.engine.engine_name}")
+
+
+    def feed(self, 
+             text_or_iterator: Union[str, Iterator[str]]):
+        """
+        Feeds text or an iterator to the stream.
+
+        Args:
+            text_or_iterator: Text or iterator to be fed.
+
+        Returns:
+            Self instance.
+        """
+        self.char_iter.add(text_or_iterator)
+        return self
+
+
+    def play_async(self,   
+                   fast_sentence_fragment: bool = True,
+                   buffer_threshold_seconds: float = 0.0,
+                   minimum_sentence_length: int = 10, 
+                   minimum_first_fragment_length : int = 10,
+                   log_synthesized_text = False,
+                   reset_generated_text: bool = True,
+                   output_wavfile: str = None,
+                   on_sentence_synthesized = None,
+                   on_audio_chunk = None,
+                   tokenizer: str = "",
+                   language: str = "",
+                   context_size: int = 12,
+                   muted: bool = False,
+                   ):
+        """
+        Async handling of text to audio synthesis, see play() method.
+        """
+        self.stream_running = True
+
+        self.play_thread = threading.Thread(target=self.play, args=(fast_sentence_fragment, buffer_threshold_seconds, minimum_sentence_length, minimum_first_fragment_length, log_synthesized_text, reset_generated_text, output_wavfile, on_sentence_synthesized, on_audio_chunk, tokenizer, language, context_size, muted))
+        self.play_thread.daemon = True
+        self.play_thread.start()
+
+    def play(self,
+            fast_sentence_fragment: bool = True,
+            buffer_threshold_seconds: float = 0.0,
+            minimum_sentence_length: int = 10,
+            minimum_first_fragment_length : int = 10,
+            log_synthesized_text = False,
+            reset_generated_text: bool = True,
+            output_wavfile: str = None,
+            on_sentence_synthesized = None,
+            on_audio_chunk = None,
+            tokenizer: str = "nltk",
+            language: str = "en",
+            context_size: int = 12,
+            muted: bool = False,
+            ):
+        """
+        Handles the synthesis of text to audio.
+        Plays the audio stream and waits until it is finished playing.
+        If the engine can't consume generators, it utilizes a player.
+
+        Args:
+        - fast_sentence_fragment: Determines if sentence fragments should be quickly yielded. Useful when a faster response is desired even if a sentence isn't complete.
+        - buffer_threshold_seconds (float): Time in seconds for the buffering threshold, influencing the flow and continuity of audio playback. Set to 0 to deactivate. Default is 0.
+          - How it Works: The system verifies whether there is more audio content in the buffer than the duration defined by buffer_threshold_seconds. If so, it proceeds to synthesize the next sentence, capitalizing on the remaining audio to maintain smooth delivery. A higher value means more audio is pre-buffered, which minimizes pauses during playback. Adjust this upwards if you encounter interruptions.
+          - Helps to decide when to generate more audio based on buffered content.
+        - minimum_sentence_length (int): The minimum number of characters a sentence must have. If a sentence is shorter, it will be concatenated with the following one, improving the overall readability. This parameter does not apply to the first sentence fragment, which is governed by `minimum_first_fragment_length`. Default is 10 characters.
+        - minimum_first_fragment_length (int): The minimum number of characters required for the first sentence fragment before yielding. Default is 10 characters.
+        - log_synthesized_text: If True, logs the synthesized text chunks.
+        - reset_generated_text: If True, resets the generated text.
+        - output_wavfile: If set, saves the audio to the specified WAV file.
+        - on_sentence_synthesized: Callback function that gets called when a single sentence fragment is synthesized.
+        - on_audio_chunk: Callback function that gets called when a single audio chunk is ready.
+        - tokenizer: Tokenizer to use for sentence splitting (currently "nltk" and "stanza" are supported).
+        - language: Language to use for sentence splitting.
+        - context_size: The number of characters used to establish context for sentence boundary detection. A larger context improves the accuracy of detecting sentence boundaries. Default is 12 characters.
+        - muted: If True, disables audio playback via local speakers (in case you want to synthesize to file or process audio chunks). Default is False.
+        """
+
+        # Log the start of the stream
+        logging.info(f"stream start")
+
+        tokenizer = tokenizer if tokenizer else self.tokenizer 
+        language = language if language else self.language
+
+        # Set the stream_running flag to indicate the stream is active
+        self.stream_start_time = time.time()
+        self.stream_running = True
+        abort_event = threading.Event()
+        self.abort_events.append(abort_event)
+
+        if self.player:
+            self.player.mute(muted)
+
+        self.output_wavfile = output_wavfile
+        self.chunk_callback = on_audio_chunk
+
+        if output_wavfile:
+            if self._is_engine_mpeg():
+                self.wf = open(output_wavfile, 'wb')
+            else:
+                self.wf = wave.open(output_wavfile, 'wb')
+                _, channels, rate = self.engine.get_stream_info()
+                self.wf.setnchannels(channels) 
+                self.wf.setsampwidth(2)
+                self.wf.setframerate(rate)
+
+        # Initialize the generated_text variable
+        if reset_generated_text:
+            self.generated_text = ""
+
+        # Check if the engine can handle generators directly
+        if self.engine.can_consume_generators:
+
+            try:
+                # Directly synthesize audio using the character iterator
+                self.char_iter.log_characters = self.log_characters
+
+                self.engine.on_audio_chunk = self._on_audio_chunk
+                self.engine.synthesize(self.char_iter)
+
+                if self.on_audio_stream_stop:
+                    self.on_audio_stream_stop()
+
+            finally:
+                # Once done, set the stream running flag to False and log the stream stop
+                self.stream_running = False
+                logging.info("stream stop")
+
+                # Accumulate the generated text and reset the character iterators
+                self.generated_text += self.char_iter.iterated_text
+
+                self._create_iterators()
+        else:
+            try:
+                # Start the audio player to handle playback
+                self.player.start()
+                self.player.on_audio_chunk = self._on_audio_chunk
+
+                # Generate sentences from the characters
+                generate_sentences = s2s.generate_sentences(self.thread_safe_char_iter, context_size=context_size, minimum_sentence_length=minimum_sentence_length, minimum_first_fragment_length=minimum_first_fragment_length, quick_yield_single_sentence_fragment=fast_sentence_fragment, cleanup_text_links=True, cleanup_text_emojis=True, tokenizer=tokenizer, language=language, log_characters=self.log_characters)
+
+                # Create the synthesis chunk generator with the given sentences
+                chunk_generator = self._synthesis_chunk_generator(generate_sentences, buffer_threshold_seconds, log_synthesized_text)
+
+                sentence_queue = queue.Queue()
+
+                def synthesize_worker():
+                    while not abort_event.is_set():
+                        sentence = sentence_queue.get()
+                        if sentence is None:  # Sentinel value to stop the worker
+                            break
+
+                        synthesis_successful = False
+                        if log_synthesized_text:
+                            logging.info(f"synthesizing: {sentence}")
+
+                        while not synthesis_successful:
+                            try:
+                                if abort_event.is_set():
+                                    break
+                                success = self.engine.synthesize(sentence)
+                                if success:
+                                    if on_sentence_synthesized:
+                                        on_sentence_synthesized(sentence)
+                                    synthesis_successful = True
+                                else:
+                                    logging.warning(f"engine {self.engine.engine_name} failed to synthesize sentence \"{sentence}\", unknown error")
+
+                            except Exception as e:
+                                logging.warning(f"engine {self.engine.engine_name} failed to synthesize sentence \"{sentence}\" with error: {e}")
+                                tb_str = traceback.format_exc()
+                                print (f"Traceback: {tb_str}")
+                                print (f"Error: {e}")                                
+
+                            if not synthesis_successful:
+                                if len(self.engines) == 1:
+                                    time.sleep(0.2)
+                                    logging.warning(f"engine {self.engine.engine_name} is the only engine available, can't switch to another engine")
+                                    break
+                                else:
+                                    logging.warning(f"fallback engine(s) available, switching to next engine")
+                                    self.engine_index = (self.engine_index + 1) % len(self.engines)
+
+                                    self.player.stop()
+                                    self.load_engine(self.engines[self.engine_index])
+                                    self.player.start()
+                                    self.player.on_audio_chunk = self._on_audio_chunk
+
+                        sentence_queue.task_done()
+
+
+                worker_thread = threading.Thread(target=synthesize_worker)
+                worker_thread.start()      
+
+                # Iterate through the synthesized chunks and feed them to the engine for audio synthesis
+                for sentence in chunk_generator:
+                    if abort_event.is_set():
+                        break
+                    sentence = sentence.strip()
+                    sentence_queue.put(sentence)
+                    if not self.stream_running:
+                        break
+
+                # Signal to the worker to stop
+                sentence_queue.put(None)
+                worker_thread.join()   
+
+            except Exception as e:
+                logging.warning(f"error in play() with engine {self.engine.engine_name}: {e}")
+                tb_str = traceback.format_exc()
+                print (f"Traceback: {tb_str}")
+                print (f"Error: {e}")
+
+            finally:
+                try:
+                   
+                    self.player.stop()
+
+                    self.abort_events.remove(abort_event)
+                    self.stream_running = False
+                    logging.info("stream stop")
+
+                    self.output_wavfile = None
+                    self.chunk_callback = None
+
+                    if reset_generated_text and self.on_audio_stream_stop:
+                        self.on_audio_stream_stop()
+                finally:
+                    if output_wavfile and self.wf:
+                        self.wf.close()
+                        self.wf = None
+
+            if self.stream_running and len(self.char_iter.items) > 0 and self.char_iter.iterated_text == "":
+                # new text was feeded while playing audio but after the last character was processed
+                # we need to start another play() call
+                self.play(fast_sentence_fragment, buffer_threshold_seconds, minimum_sentence_length, log_synthesized_text, reset_generated_text=False)
+
+
+    def pause(self):
+        """
+        Pauses playback of the synthesized audio stream (won't work properly with elevenlabs).
+        """
+        if self.is_playing():
+            logging.info("stream pause")
+            if self.engine.can_consume_generators:
+                self.engine.pause()
+            else:
+                self.player.pause()
+
+
+    def resume(self):
+        """
+        Resumes a previously paused playback of the synthesized audio stream 
+        - won't work properly with elevenlabs
+        """
+        if self.is_playing():
+            logging.info("stream resume")
+            if self.engine.can_consume_generators:
+                self.engine.resume()
+            else:
+                self.player.resume()
+
+
+    def stop(self):
+        """
+        Stops the playback of the synthesized audio stream immediately.
+        """
+
+        for abort_event in self.abort_events:
+            abort_event.set()
+    
+        if self.is_playing():
+            self.char_iter.stop()
+            if self.engine.can_consume_generators:
+                if self.engine.stop():
+                    self.stream_running = False
+            else:
+                self.player.stop(immediate=True)
+                self.stream_running = False
+
+        if self.play_thread is not None:
+            if self.play_thread.is_alive():
+                self.play_thread.join()
+            self.play_thread = None
+
+        self._create_iterators()    
+
+
+    def text(self):
+        """
+        Retrieves the text that has been fed into the stream.
+
+        Returns:
+            The accumulated text.
+        """        
+        if self.generated_text:
+            return self.generated_text
+        return self.thread_safe_char_iter.accumulated_text()
+
+
+    def is_playing(self):
+        """
+        Checks if the stream is currently playing.
+        
+        Returns:
+            Boolean indicating if the stream is playing.
+        """ 
+        return self.stream_running
+
+
+    
+
+    def _on_audio_stream_start(self):
+        """
+        Handles the start of the audio stream.
+
+        This method is called when the audio stream starts. It calculates and logs the latency from the stream's start time to the time when the first chunk of audio is received. If a callback for handling the start of the audio stream is set (on_audio_stream_start), it is executed.
+
+        No parameters or returns.
+        """
+        latency = time.time() - self.stream_start_time
+        logging.info(f"Audio stream start, latency to first chunk: {latency:.2f}s")
+
+        if self.on_audio_stream_start:
+            self.on_audio_stream_start()
+
+
+    def _on_audio_chunk(self, chunk):
+        """
+        Postprocessing of single chunks of audio data.
+        This method is called for each chunk of audio data processed. It first determines the audio stream format.
+        If the format is `pyaudio.paFloat32`, we convert to paInt16. 
+
+        Args:
+            chunk (bytes): The audio data chunk to be processed.
+        """        
+        format, _, _ = self.engine.get_stream_info()
+        
+        if format == pyaudio.paFloat32:
+            audio_data = np.frombuffer(chunk, dtype=np.float32)
+            audio_data = np.int16(audio_data * 32767)
+            chunk = audio_data.tobytes()
+
+        if self.output_wavfile and self.wf:
+            if self._is_engine_mpeg():
+                self.wf.write(chunk)
+            else:
+                self.wf.writeframes(chunk)
+
+        if self.chunk_callback:
+            self.chunk_callback(chunk)
+
+
+    def _on_last_character(self):
+        """
+        This method is invoked when the last character of the text stream has been processed.
+        It logs information and triggers a callback, if defined.
+        """
+
+        # If an on_text_stream_stop callback is defined, invoke it to signal the end of the text stream
+        if self.on_text_stream_stop:
+            self.on_text_stream_stop()
+
+        # If log_characters flag is True, print a new line for better log readability
+        if self.log_characters:
+            print()    
+
+        self._create_iterators()
+
+
+    def _create_iterators(self):
+        """
+        Creates iterators required for text-to-audio streaming.
+
+        This method initializes two types of iterators:
+
+        1. `CharIterator`: Responsible for managing individual characters during the streaming process.
+        - It takes callbacks for events like when a character is processed (`on_character`), when the first text chunk is encountered (`on_first_text_chunk`), and when the last text chunk is encountered (`on_last_text_chunk`).
+
+        2. `AccumulatingThreadSafeGenerator`: A thread-safe wrapper around `CharIterator`.
+        - Ensures that the character iterator can be safely accessed from multiple threads.
+        """        
+
+        # Create a CharIterator instance for managing individual characters
+        self.char_iter = CharIterator(on_character=self._on_character, on_first_text_chunk=self.on_text_stream_start, on_last_text_chunk=self._on_last_character)
+
+        # Create a thread-safe version of the char iterator
+        self.thread_safe_char_iter = AccumulatingThreadSafeGenerator(self.char_iter)
+
+
+    def _on_character(self, char: str):
+        """
+        This method is called for each character that is processed in the text stream.
+        It accumulates the characters and invokes a callback.
+        
+        Args:
+            char (str): The character currently being processed.
+        """
+        # If an on_character callback is defined, invoke it for the current character
+        if self.on_character:
+            self.on_character(char)
+
+        self.generated_text += char
+
+
+    def _is_engine_mpeg(self):
+        """
+        Checks if the engine is an MPEG engine.
+
+        Returns:
+            Boolean indicating if the engine is an MPEG engine.
+        """
+        format, channel, rate = self.engine.get_stream_info()
+        return format == pyaudio.paCustomFormat and channel == -1 and rate == -1
+    
+
+    def _synthesis_chunk_generator(self,
+                                  generator: Iterator[str],
+                                  buffer_threshold_seconds: float = 2.0,
+                                  log_synthesis_chunks: bool = False) -> Iterator[str]:
+        """
+        Generates synthesis chunks based on buffered audio length.
+
+        The function buffers chunks of synthesis until the buffered audio seconds fall below the provided threshold. 
+        Once the threshold is crossed, the buffered synthesis chunk is yielded.
+
+        Args:
+            generator: Input iterator that provides chunks for synthesis.
+            buffer_threshold_seconds: Time in seconds to specify how long audio data should be buffered before yielding the synthesis chunk.
+            log_synthesis_chunks: Boolean flag that, if set to True, logs the synthesis chunks to the logging system.
+
+        Returns:
+            Iterator of synthesis chunks.
+        """     
+
+        # Initializes an empty string to accumulate chunks of synthesis
+        synthesis_chunk = ""
+        
+        # Iterates over each chunk from the provided generator
+        for chunk in generator:
+
+            # Fetch the total seconds of buffered audio
+            buffered_audio_seconds = self.player.get_buffered_seconds()
+            
+            # Append the current chunk (and a space) to the accumulated synthesis_chunk
+            synthesis_chunk += chunk + " "
+            
+            # Check if the buffered audio is below the specified threshold
+            if buffered_audio_seconds < buffer_threshold_seconds or buffer_threshold_seconds <= 0:
+                # If the log_synthesis_chunks flag is True, log the current synthesis_chunk
+                if log_synthesis_chunks:
+                    logging.info(f"-- [\"{synthesis_chunk}\"], buffered {buffered_audio_seconds:1f}s")
+                
+                # Yield the current synthesis_chunk and reset it for the next set of accumulations
+                yield synthesis_chunk
+                synthesis_chunk = ""
+
+            else:
+                logging.info(f"summing up chunks because buffer {buffered_audio_seconds:.1f} > threshold ({buffer_threshold_seconds:.1f}s)")
+
+        # After iterating over all chunks, check if there's any remaining data in synthesis_chunk
+        if synthesis_chunk:
+            # If the log_synthesis_chunks flag is True, log the remaining synthesis_chunk
+            if log_synthesis_chunks:
+                logging.info(f"-- [\"{synthesis_chunk}\"], buffered {buffered_audio_seconds:.1f}s")
+            
+            # Yield the remaining synthesis_chunk
+            yield synthesis_chunk</"file: xtts_api_server\RealtimeTTS\text_to_stream.py">
+
+<"file: xtts_api_server\RealtimeTTS\threadsafe_generators.py"># """
+# threadsafe_generators.py
+
+# This file contains a collection of classes aimed at providing thread-safe operations over generators 
+# and iterables. 
+
+# The utility of this module can be mainly seen in multi-threaded environments where generators or iterables 
+# need to be consumed across threads without race conditions. Additionally, functionalities like character-based 
+# iteration and accumulation are provided for enhanced flexibility.
+# """
+
+
+from typing import Union, Iterator
+import threading
+
+class CharIterator:
+    """
+    An iterator that allows iteration over characters of strings or string iterators. 
+
+    This class provides an interface for adding either strings or string iterators. When iterated upon, 
+    it will yield characters from the added items. Additionally, it provides functionalities to stop 
+    the iteration and accumulate iterated text.
+
+    Attributes:
+        items (List[Union[str, Iterator[str]]]): The list of strings or string iterators added to the CharIterator.
+        _index (int): The current index in the items list that is being iterated.
+        _char_index (int, optional): The current character index in the current string being iterated. None if currently iterating over an iterator.
+        _current_iterator (Iterator[str], optional): The current iterator being consumed. None if currently iterating over a string.
+        immediate_stop (threading.Event): An event signaling if the iteration should be stopped immediately.
+        iterated_text (str): Accumulates the characters that have been iterated over.
+
+    Methods:
+        add(item: Union[str, Iterator[str]]): Adds a string or a string iterator to the items list.
+        stop(): Stops the iterator immediately on the next iteration.
+    """
+
+    def __init__(self, 
+                 log_characters: bool = False,
+                 on_character=None,
+                 on_first_text_chunk=None,
+                 on_last_text_chunk=None):
+        """
+        Initialize the CharIterator instance.
+
+        Args:
+        - log_characters: If True, logs the characters processed.
+        """
+        self.items = []
+        self._index = 0
+        self._char_index = None
+        self._current_iterator = None
+        self.immediate_stop = threading.Event()
+        self.iterated_text = ""
+        self.log_characters = log_characters
+        self.on_character = on_character
+        self.on_first_text_chunk = on_first_text_chunk
+        self.on_last_text_chunk = on_last_text_chunk
+        self.first_chunk_received = False
+
+    def add(self, item: Union[str, Iterator[str]]) -> None:
+        """
+        Add a string or a string iterator to the list of items.
+
+        Args:
+            item (Union[str, Iterator[str]]): The string or string iterator to add.
+        """
+        self.items.append(item)
+
+    def stop(self):
+        """
+        Signal the iterator to stop immediately during the next iteration.
+        """
+        self.immediate_stop.set()        
+
+    def __iter__(self) -> "CharIterator":
+        """
+        Returns the iterator object itself.
+
+        Returns:
+            CharIterator: The instance of CharIterator.
+        """
+        return self
+
+    def __next__(self) -> str:
+        """
+        Fetch the next character from the current string or string iterator in the items list.
+
+        If the current item is a string, it will yield characters from the string until it's exhausted. 
+        If the current item is a string iterator, it will yield characters from the iterator until it's exhausted.
+
+        Returns:
+            str: The next character.
+
+        Raises:
+            StopIteration: If there are no more characters left or the immediate_stop event is set.
+        """
+
+        # Check if the stop event has been triggered, if so, end the iteration immediately
+        if self.immediate_stop.is_set():
+            raise StopIteration
+        
+        # Continue while there are items left to iterate over
+        while self._index < len(self.items):
+
+            # Get the current item (either a string or an iterator)
+            item = self.items[self._index]
+
+            # Check if the item is a string
+            if isinstance(item, str):
+
+                if self._char_index is None:
+                    self._char_index = 0
+
+                # If there are characters left in the string to yield
+                if self._char_index < len(item):
+                    char = item[self._char_index]
+                    self._char_index += 1
+
+                    # Accumulate the iterated character to the iterated_text attribute
+                    self.iterated_text += char
+                    if self.log_characters:
+                        print(char, end="", flush=True)
+                    if self.on_character:
+                        self.on_character(char) 
+
+                    if not self.first_chunk_received and self.on_first_text_chunk:
+                        self.on_first_text_chunk()
+
+                    self.first_chunk_received = True
+
+                    return char
+                
+                else:
+                    # If the string is exhausted, reset the character index and move on to the next item
+                    self._char_index = None
+                    self._index += 1
+
+            else:
+                # The item is a string iterator
+
+                # If we haven't started iterating over this iterator yet, initialize it
+                if self._current_iterator is None:
+                    self._current_iterator = iter(item)
+
+                if self._char_index is None:
+                    try:                    
+                        self._current_str = next(self._current_iterator)
+
+                        # fix for new openai api
+                        if hasattr(self._current_str, "choices"):
+                            chunk = self._current_str.choices[0].delta.content
+                            chunk = str(chunk) if chunk else ""
+                            self._current_str = chunk
+
+                    except StopIteration:
+                        
+                        # If the iterator is exhausted, reset it and move on to the next item
+                        self._char_index = None
+                        self._current_iterator = None
+                        self._index += 1    
+                        continue
+                    
+                    self._char_index = 0
+
+                if self._char_index < len(self._current_str):
+                    char = self._current_str[self._char_index]
+                    self._char_index += 1
+
+                    self.iterated_text += char
+                    if self.log_characters:
+                        print(char, end="", flush=True)                    
+                    if self.on_character:
+                        self.on_character(char)                        
+                    
+                    if not self.first_chunk_received and self.on_first_text_chunk:
+                        self.on_first_text_chunk()
+
+                    self.first_chunk_received = True                    
+
+                    return char
+                
+                else:
+                    self._char_index = None
+
+            
+        if self.iterated_text and self.on_last_text_chunk:
+                self.on_last_text_chunk()
+
+        # If all items are exhausted, raise the StopIteration exception to signify end of iteration
+        raise StopIteration
+
+import threading
+
+class AccumulatingThreadSafeGenerator:
+    """
+    A thread-safe generator that accumulates the iterated tokens into a text.
+    """
+
+    def __init__(self, gen_func, on_first_text_chunk=None, on_last_text_chunk=None):
+        """
+        Initialize the AccumulatingThreadSafeGenerator instance.
+
+        Args:
+            gen_func: The generator function to be used.
+            on_first_text_chunk: Callback function to be executed after the first chunk of text is received.
+            on_last_text_chunk: Callback function to be executed after the last chunk of text is received.
+        """
+        self.lock = threading.Lock()
+        self.generator = gen_func
+        self.exhausted = False
+        self.iterated_text = ""
+        self.on_first_text_chunk = on_first_text_chunk
+        self.on_last_text_chunk = on_last_text_chunk
+        self.first_chunk_received = False
+
+    def __iter__(self):
+        """
+        Returns the iterator object itself.
+
+        Returns:
+            AccumulatingThreadSafeGenerator: The instance of AccumulatingThreadSafeGenerator.
+        """
+        return self
+
+    def __next__(self):
+        """
+        Fetch the next token from the generator in a thread-safe manner.
+
+        Returns:
+            The next item from the generator.
+
+        Raises:
+            StopIteration: If there are no more items left in the generator.
+        """
+        with self.lock:
+            try:
+                token = next(self.generator) 
+                self.iterated_text += str(token)
+
+                if not self.first_chunk_received and self.on_first_text_chunk:
+                    self.on_first_text_chunk()
+
+                self.first_chunk_received = True
+                return token
+
+            except StopIteration:
+                if self.iterated_text and self.on_last_text_chunk:
+                    self.on_last_text_chunk()
+                self.exhausted = True
+                raise
+
+    def is_exhausted(self):
+        """
+        Check if the generator has been exhausted.
+
+        Returns:
+            bool: True if the generator is exhausted, False otherwise.
+        """
+        with self.lock:
+            return self.exhausted
+
+    def accumulated_text(self):
+        """
+        Retrieve the accumulated text from the iterated tokens.
+
+        Returns:
+            str: The accumulated text.
+        """
+        with self.lock:
+            return self.iterated_text</"file: xtts_api_server\RealtimeTTS\threadsafe_generators.py">
+
+<"file: xtts_api_server\RealtimeTTS\stream_player.py">"""
+Stream management
+"""
+
+from pydub import AudioSegment
+import threading
+import pyaudio
+import logging
+import queue
+import time
+import io
+
+
+class AudioConfiguration:
+    """
+    Defines the configuration for an audio stream.
+    """
+
+    def __init__(self, format: int = pyaudio.paInt16, channels: int = 1, rate: int = 16000):
+        """
+        Args:
+            format (int): Audio format, defaults to pyaudio.paInt16
+            channels (int): Number of channels, defaults to 1 (mono)
+            rate (int): Sample rate, defaults to 16000
+        """
+        self.format = format
+        self.channels = channels
+        self.rate = rate
+
+
+class AudioStream:
+    """
+    Handles audio stream operations such as opening, starting, stopping, and closing.
+    """
+
+    def __init__(self, config: AudioConfiguration):
+        """
+        Args:
+            config (AudioConfiguration): Object containing audio settings.
+        """
+        self.config = config
+        self.stream = None
+        self.pyaudio_instance = pyaudio.PyAudio()
+
+    def open_stream(self):
+        """Opens an audio stream."""
+
+        # check for mpeg format
+        pyChannels = self.config.channels
+        pySampleRate = self.config.rate
+
+        if self.config.format == pyaudio.paCustomFormat:
+            pyFormat = self.pyaudio_instance.get_format_from_width(2)
+            logging.debug(f"Opening stream for mpeg audio chunks, pyFormat: {pyFormat}, pyChannels: {pyChannels}, pySampleRate: {pySampleRate}")
+        else:
+            pyFormat = self.config.format
+            logging.debug(f"Opening stream for wave audio chunks, pyFormat: {pyFormat}, pyChannels: {pyChannels}, pySampleRate: {pySampleRate}")
+
+        self.stream = self.pyaudio_instance.open(format=pyFormat, channels=pyChannels, rate=pySampleRate, output=True)
+
+    def start_stream(self):
+        """Starts the audio stream."""
+        if self.stream and not self.stream.is_active():
+            self.stream.start_stream()
+
+    def stop_stream(self):
+        """Stops the audio stream."""
+        if self.stream and self.stream.is_active():
+            self.stream.stop_stream()
+
+    def close_stream(self):
+        """Closes the audio stream."""
+        if self.stream:
+            self.stop_stream()
+            self.stream.close()
+
+    def is_stream_active(self) -> bool:
+        """
+        Checks if the audio stream is active.
+
+        Returns:
+            bool: True if the stream is active, False otherwise.
+        """
+        return self.stream and self.stream.is_active()
+
+
+class AudioBufferManager:
+    """
+    Manages an audio buffer, allowing addition and retrieval of audio data.
+    """
+
+    def __init__(self, audio_buffer: queue.Queue):
+        """
+        Args:
+            audio_buffer (queue.Queue): Queue to be used as the audio buffer.
+        """
+        self.audio_buffer = audio_buffer
+        self.total_samples = 0
+
+    def add_to_buffer(self, audio_data):
+        """
+        Adds audio data to the buffer.
+
+        Args:
+            audio_data: Audio data to be added.
+        """
+        self.audio_buffer.put(audio_data)
+        self.total_samples += len(audio_data) // 2
+
+    def clear_buffer(self):
+        """Clears all audio data from the buffer."""
+        while not self.audio_buffer.empty():
+            try:
+                self.audio_buffer.get_nowait()
+            except queue.Empty:
+                continue
+        self.total_samples = 0
+
+    def get_from_buffer(self, timeout: float = 0.05):
+        """
+        Retrieves audio data from the buffer.
+
+        Args:
+            timeout (float): Time (in seconds) to wait before raising a queue.Empty exception.
+
+        Returns:
+            The audio data chunk or None if the buffer is empty.
+        """
+        try:
+            chunk = self.audio_buffer.get(timeout=timeout)
+            self.total_samples -= len(chunk) // 2
+            return chunk
+        except queue.Empty:
+            return None
+
+    def get_buffered_seconds(self, rate: int) -> float:
+        """
+        Calculates the duration (in seconds) of the buffered audio data.
+
+        Args:
+            rate (int): Sample rate of the audio data.
+
+        Returns:
+            float: Duration of buffered audio in seconds.
+        """
+        return self.total_samples / rate
+
+
+class StreamPlayer:
+    """
+    Manages audio playback operations such as start, stop, pause, and resume.
+    """
+
+    def __init__(self, audio_buffer: queue.Queue, config: AudioConfiguration, on_playback_start=None, on_playback_stop=None, on_audio_chunk=None, muted = False):
+        """
+        Args:
+            audio_buffer (queue.Queue): Queue to be used as the audio buffer.
+            config (AudioConfiguration): Object containing audio settings.
+            on_playback_start (Callable, optional): Callback function to be called at the start of playback. Defaults to None.
+            on_playback_stop (Callable, optional): Callback function to be called at the stop of playback. Defaults to None.
+        """
+        self.buffer_manager = AudioBufferManager(audio_buffer)
+        self.audio_stream = AudioStream(config)
+        self.playback_active = False
+        self.immediate_stop = threading.Event()
+        self.pause_event = threading.Event()
+        self.playback_thread = None
+        self.on_playback_start = on_playback_start
+        self.on_playback_stop = on_playback_stop
+        self.on_audio_chunk = on_audio_chunk
+        self.first_chunk_played = False
+        self.muted = muted
+
+    def _play_chunk(self, chunk):
+        """
+        Plays a chunk of audio data.
+
+        Args:
+            chunk: Chunk of audio data to be played.
+        """
+
+        # handle mpeg
+        if self.audio_stream.config.format == pyaudio.paCustomFormat:
+
+            # convert to pcm using pydub
+            segment = AudioSegment.from_file(io.BytesIO(chunk), format="mp3")
+            chunk = segment.raw_data
+
+        sub_chunk_size = 1024
+        
+        for i in range(0, len(chunk), sub_chunk_size):
+            sub_chunk = chunk[i:i + sub_chunk_size]
+
+            if not self.muted:
+                self.audio_stream.stream.write(sub_chunk)
+
+            if self.on_audio_chunk:
+                self.on_audio_chunk(sub_chunk)
+
+            if not self.first_chunk_played and self.on_playback_start:
+                self.on_playback_start()
+                self.first_chunk_played = True            
+
+            # Pause playback if the event is set
+            while self.pause_event.is_set():
+                time.sleep(0.01)
+
+            if self.immediate_stop.is_set():
+                break
+
+    def _process_buffer(self):
+        """Processes and plays audio data from the buffer until it's empty or playback is stopped."""
+        while self.playback_active or not self.buffer_manager.audio_buffer.empty():
+            chunk = self.buffer_manager.get_from_buffer()
+            if chunk:
+                self._play_chunk(chunk)
+
+            if self.immediate_stop.is_set():
+                logging.info("Immediate stop requested, aborting playback")
+                break
+        if self.on_playback_stop:
+            self.on_playback_stop()
+            
+    def get_buffered_seconds(self) -> float:
+        """
+        Calculates the duration (in seconds) of the buffered audio data.
+
+        Returns:
+            float: Duration of buffered audio in seconds.
+        """
+        total_samples = sum(len(chunk) // 2 for chunk in list(self.buffer_manager.audio_buffer.queue))
+        return total_samples / self.audio_stream.config.rate
+
+    def start(self):
+        """Starts audio playback."""
+        self.first_chunk_played = False
+        self.playback_active = True
+        self.audio_stream.open_stream()
+        self.audio_stream.start_stream()
+        self.playback_thread = threading.Thread(target=self._process_buffer)
+        self.playback_thread.start()
+
+    def stop(self, immediate: bool = False):
+        """
+        Stops audio playback.
+
+        Args:
+            immediate (bool): If True, stops playback immediately without waiting for buffer to empty.
+        """
+        if not self.playback_thread:
+            logging.warn("No playback thread found, cannot stop playback")
+            return
+
+        if immediate:
+            self.immediate_stop.set()
+            while self.playback_active:
+                time.sleep(0.1)
+            return
+
+        self.playback_active = False
+
+        if self.playback_thread and self.playback_thread.is_alive():
+            self.playback_thread.join()
+
+        time.sleep(0.1)
+
+        self.audio_stream.close_stream()
+        self.immediate_stop.clear()
+        self.buffer_manager.clear_buffer()
+        self.playback_thread = None
+
+    def pause(self):
+        """Pauses audio playback."""
+        self.pause_event.set()
+
+    def resume(self):
+        """Resumes paused audio playback."""
+        self.pause_event.clear()
+
+    def mute(self, muted: bool = True):
+        """Mutes audio playback."""
+        self.muted = muted</"file: xtts_api_server\RealtimeTTS\stream_player.py">
+
+<"file: xtts_api_server\RealtimeTTS\engines\coqui_engine.py">from xtts_api_server.tts_funcs import official_model_list
+from torch.multiprocessing import Process, Pipe, Event, set_start_method
+from .base_engine import BaseEngine
+from typing import Union, List
+from threading import Lock
+from tqdm import tqdm
+from loguru import logger
+import numpy as np
+import traceback
+import requests
+import logging
+import pyaudio
+import torch
+import json
+import os
+import re
+
+class CoquiEngine(BaseEngine):
+
+    def __init__(self, 
+                 model_name = "tts_models/multilingual/multi-dataset/xtts_v2",
+                 specific_model = "2.0.2",
+                 local_models_path = None, # specify a global model path here (otherwise it will create a directory "models" in the script directory)
+                 voices_path = None,
+                 cloning_reference_wav: Union[str, List[str]] = "",
+                 language = "en",
+                 speed = 1.0,
+                 thread_count = 6,
+                 stream_chunk_size = 20,
+                 overlap_wav_len = 1024,
+                 temperature = 0.85,
+                 length_penalty = 1.0,
+                 repetition_penalty = 7.0,
+                 top_k = 50,
+                 top_p = 0.85,
+                 enable_text_splitting = True,
+                 full_sentences = False,
+                 level=logging.WARNING,
+                 use_mps = False,
+                 use_deepspeed = False,
+                 prepare_text_for_synthesis_callback = None,
+                 ):
+        """
+        Initializes a coqui voice realtime text to speech engine object.
+
+        Args:
+            model_name (str): Name of the coqui model to use. Tested with XTTS only.
+            specific_model (str): Name of the specific model to use. If not specified, the most recent model will be downloaded.
+            local_models_path (str): Path to a local models directory. If not specified, a directory "models" will be created in the script directory.
+            cloning_reference_wav (str): Name to the file containing the voice to clone. Works with a 44100Hz or 22050Hz mono 32bit float WAV file.
+            language (str): Language to use for the coqui model.
+            speed (float): Speed factor for the coqui model.
+            thread_count (int): Number of threads to use for the coqui model.
+            stream_chunk_size (int): Chunk size for the coqui model.
+            overlap_wav_len (int): Overlap length for the coqui model.
+            temperature (float): Temperature for the coqui model.
+            length_penalty (float): Length penalty for the coqui model.
+            repetition_penalty (float): Repetition penalty for the coqui model.
+            top_k (int): Top K for the coqui model. 
+            top_p (float): Top P for the coqui model.
+            enable_text_splitting (bool): Enable text splitting for the coqui model.
+            full_sentences (bool): Enable full sentences for the coqui model.
+            level (int): Logging level for the coqui model.
+            use_mps (bool): Enable MPS for the coqui model.
+            use_deepspeed (bool): Enable deepspeed for the coqui model.
+            prepare_text_for_synthesis_callback (function): Function to prepare text for synthesis. If not specified, a default sentence parser will be used. 
+        """
+
+        self._synthesize_lock = Lock()
+        self.model_name = model_name
+        self.language = language
+        self.cloning_reference_wav = cloning_reference_wav
+        self.speed = speed
+        self.specific_model = specific_model
+        if not local_models_path:
+            local_models_path = os.environ.get("COQUI_MODEL_PATH")
+            if local_models_path and len(local_models_path) > 0:
+                logging.info(f"Local models path from environment variable COQUI_MODEL_PATH: \"{local_models_path}\"")
+        self.local_models_path = local_models_path
+        self.prepare_text_for_synthesis_callback = prepare_text_for_synthesis_callback
+
+        # Start the worker process
+        set_start_method('spawn')
+        self.main_synthesize_ready_event = Event()
+        self.parent_synthesize_pipe, child_synthesize_pipe = Pipe()
+        self.voices_path = voices_path
+
+        # download coqui model
+        self.local_model_path = None
+        if not self.specific_model:
+            from TTS.utils.manage import ModelManager
+            logging.info(f"Download most recent XTTS Model if available")
+            ModelManager().download_model(model_name)
+        else:
+            logging.info(f"Local XTTS Model: \"{specific_model}\" specified")
+            is_official_model = False
+            for model in official_model_list:
+              if self.specific_model == model:
+                is_official_model = True
+                break
+
+            if is_official_model:
+              logger.info(f"Loading official model '{specific_model}' for streaming")
+              self.local_model_path = self.download_model(specific_model, local_models_path)
+            else:
+              logger.info(f"Loading custom model '{specific_model}' for streaming")
+              self.local_model_path = os.path.join(local_models_path,specific_model)
+
+        self.synthesize_process = Process(target=CoquiEngine._synthesize_worker, args=(child_synthesize_pipe, model_name, cloning_reference_wav, language, self.main_synthesize_ready_event, level, self.speed, thread_count, stream_chunk_size, full_sentences, overlap_wav_len, temperature, length_penalty, repetition_penalty, top_k, top_p, enable_text_splitting, use_mps, self.local_model_path, use_deepspeed, self.voices_path))
+        self.synthesize_process.start()
+
+        logging.debug('Waiting for coqui text to speech synthesize model to start')
+        self.main_synthesize_ready_event.wait()
+        logging.info('Coqui synthesis model ready')
+
+    def post_init(self):
+        self.engine_name = "coqui"
+
+    @staticmethod
+    def _synthesize_worker(conn, model_name, cloning_reference_wav: Union[str, List[str]], language, ready_event, loglevel, speed, thread_count, stream_chunk_size, full_sentences, overlap_wav_len, temperature, length_penalty, repetition_penalty, top_k, top_p, enable_text_splitting, use_mps, local_model_path, use_deepspeed, voices_path):
+        """
+        Worker process for the coqui text to speech synthesis model.
+
+        Args:
+            conn (multiprocessing.Connection): Connection to the parent process.
+            model_name (str): Name of the coqui model to use.
+            cloning_reference_wav (str): Name to the file containing the voice to clone.
+            language (str): Language to use for the coqui model.
+            ready_event (multiprocessing.Event): Event to signal when the model is ready.
+        """
+
+        from TTS.utils.generic_utils import get_user_data_dir
+        from TTS.tts.configs.xtts_config import XttsConfig
+        from TTS.tts.models.xtts import Xtts
+        from TTS.config import load_config
+        from TTS.tts.models import setup_model as setup_tts_model
+
+        logging.basicConfig(format='CoquiEngine: %(message)s', level=loglevel)
+
+        logging.info(f"Starting CoquiEngine")
+
+
+        def get_conditioning_latents(filenames: Union[str, List[str]]):
+            """
+            Whoever reads this method.
+            I am sorry, it's a mess and in a terrible state.
+            It needs urgent rework but currently have other more important things to do.
+            """
+            if not isinstance(filenames, list):
+                filenames = [filenames]
+
+            logging.debug(f"Computing speaker latents")
+
+            if len(filenames) == 0 or not filenames[0]:
+                logging.debug(f"Using coqui_default_voice.wav as default voice")
+                filenames = ["coqui_default_voice.wav"]
+
+            if len(filenames) == 1:
+                logging.debug(f"Old handling one voice file")
+                # verify that filename ends with .wav
+                filename = filenames[0]
+                if filename.endswith(".json"):
+                    filename_json = filename
+                    filename = filename[:-5]
+                    filename_wav = filename + "wav"
+                elif filename.endswith(".wav"):
+                    filename_json = filename[:-3] + "json"
+                    filename = filename[:-3]
+                    filename_wav = filename + "wav"
+                else:
+                    filename_json = filename + ".json"
+                    filename_wav = filename + ".wav"
+
+                if voices_path:
+                    filename_voice_wav = os.path.join(voices_path, filename_wav)
+                    filename_voice_json = os.path.join(voices_path, filename_json)
+                else:
+                    filename_voice_wav = filename_wav
+                    filename_voice_json = filename_json
+
+                if not os.path.exists(filename_voice_json) and not os.path.exists(filename_voice_wav):
+                    if len(filename) > 0:
+                        logging.info(f"Using default voice, both {filename_voice_json} and {filename_voice_wav} not found.")
+                    else:
+                        logging.info(f"Using default voice, no cloning source specified.")
+                    
+                    # Get the directory of the current script
+                    current_dir = os.path.dirname(os.path.realpath(__file__))
+                    filename_voice_json = os.path.join(current_dir, "coqui_default_voice.json")
+                    if not os.path.exists(filename_voice_json):
+                        raise ValueError(f"Default voice file {filename_voice_json} not found.")                
+
+                # check if latents are already computed
+                if os.path.exists(filename_voice_json):
+                    logging.debug(f"Latents already computed, reading from {filename_voice_json}")
+                    with open(filename_voice_json, "r") as new_file:
+                        latents = json.load(new_file)
+
+                    speaker_embedding = (torch.tensor(latents["speaker_embedding"]).unsqueeze(0).unsqueeze(-1))
+                    gpt_cond_latent = (torch.tensor(latents["gpt_cond_latent"]).reshape((-1, 1024)).unsqueeze(0))                
+
+                    return gpt_cond_latent, speaker_embedding                
+                
+                # compute and write latents to json file
+                logging.debug(f"Computing latents for {filename}")
+
+                gpt_cond_latent, speaker_embedding = tts.get_conditioning_latents(audio_path=filename_voice_wav, gpt_cond_len=30, max_ref_length=60)
+
+                latents = {
+                    "gpt_cond_latent": gpt_cond_latent.cpu().squeeze().half().tolist(),
+                    "speaker_embedding": speaker_embedding.cpu().squeeze().half().tolist(),
+                }
+                with open(filename_voice_json, "w") as new_file:
+                    json.dump(latents, new_file)
+
+                return gpt_cond_latent, speaker_embedding
+
+            else:
+                audio_path_list = []
+                for filename in filenames:
+                    # verify that filename ends with .wav
+                    if filename.endswith(".wav"):
+                        if voices_path:
+                            filename_voice_wav = os.path.join(voices_path, filename)
+                        else:
+                            filename_voice_wav = filename
+                        audio_path_list.append(filename_voice_wav)
+                        logging.debug(f"Added {filename_voice_wav} (#{len(audio_path_list)}) to audio_path_list")
+
+                if len(audio_path_list) == 0:
+                    logging.info(f"Using default female voice, no cloning source specified.")
+                    
+                    # Get the directory of the current script
+                    current_dir = os.path.dirname(os.path.realpath(__file__))
+                    filename_voice_json = os.path.join(current_dir, "coqui_default_voice.json")
+                    if not os.path.exists(filename_voice_json):
+                        raise ValueError(f"Default voice file {filename_voice_json} not found.")                
+
+                # compute and write latents to json file
+                logging.debug(f"Computing latents for {filename}")
+
+                gpt_cond_latent, speaker_embedding = tts.get_conditioning_latents(audio_path=audio_path_list, gpt_cond_len=30, max_ref_length=60)
+
+                latents = {
+                    "gpt_cond_latent": gpt_cond_latent.cpu().squeeze().half().tolist(),
+                    "speaker_embedding": speaker_embedding.cpu().squeeze().half().tolist(),
+                }
+                filename_voice_json = audio_path_list[0][:-3] + "json"
+                with open(filename_voice_json, "w") as new_file:
+                    json.dump(latents, new_file)
+
+                return gpt_cond_latent, speaker_embedding
+
+        def postprocess_wave(chunk):
+            """Post process the output waveform"""
+            if isinstance(chunk, list):
+                chunk = torch.cat(chunk, dim=0)
+            chunk = chunk.clone().detach().cpu().numpy()
+            chunk = chunk[None, : int(chunk.shape[0])]
+            chunk = np.clip(chunk, -1, 1)
+            chunk = chunk.astype(np.float32)
+            return chunk
+
+        logging.debug(f"Initializing coqui model {model_name} with cloning reference {cloning_reference_wav} and language {language}")
+
+        try:
+            logging.debug(f"Setting torch threads to {thread_count}")
+            torch.set_num_threads(int(str(thread_count)))
+
+            # Check if CUDA or MPS is available, else use CPU
+            logging.debug (f"Checking for CUDA and MPS availability")
+            if torch.cuda.is_available():
+                logging.info("CUDA available, GPU inference used.")
+                device = torch.device("cuda")
+            elif use_mps and torch.backends.mps.is_available() and torch.backends.mps.is_built():
+                logging.info("MPS available, GPU inference used.")
+                device = torch.device("mps")
+            else:
+                logging.info("CUDA and MPS not available, CPU inference used.")
+                device = torch.device("cpu")
+
+            logging.debug (f"Torch device set.")
+
+            if local_model_path:
+                logging.debug (f"Starting TTS with local path from {local_model_path} ")
+
+                config = load_config((os.path.join(local_model_path, "config.json")))
+                tts = setup_tts_model(config)
+                tts.load_checkpoint(
+                    config,
+                    checkpoint_path=os.path.join(local_model_path, "model.pth"),
+                    vocab_path=os.path.join(local_model_path, "vocab.json"),
+                    eval=True,
+                    use_deepspeed=use_deepspeed,
+                )                
+            else:
+                model_path = os.path.join(get_user_data_dir("tts"), model_name.replace("/", "--"))
+                logging.debug (f"Starting TTS with autoupdate from {model_path} ")
+
+                config = load_config((os.path.join(model_path, "config.json")))
+                tts = setup_tts_model(config)
+                tts.load_checkpoint(
+                    config,
+                    checkpoint_path=os.path.join(model_path, "model.pth"),
+                    vocab_path=os.path.join(model_path, "vocab.json"),
+                    eval=True,
+                    use_deepspeed=use_deepspeed,
+                )
+            tts.to(device)
+
+            logging.debug("XTTS Model loaded.")
+
+
+            gpt_cond_latent, speaker_embedding = get_conditioning_latents(cloning_reference_wav)
+
+        except Exception as e:
+            logging.exception(f"Error initializing main coqui engine model: {e}")
+            raise
+
+        ready_event.set()
+
+        logging.info('Coqui text to speech synthesize model initialized successfully')
+
+        try:
+            while True:
+                message = conn.recv()  
+                command = message['command']
+                data = message['data']
+
+                if command == 'update_reference':
+                    new_wav_path = data['cloning_reference_wav']
+                    logging.info(f'Updating reference WAV to {new_wav_path}')                    
+                    gpt_cond_latent, speaker_embedding = get_conditioning_latents(new_wav_path)
+                    conn.send(('success', 'Reference updated successfully'))
+
+                elif command == 'set_speed':
+                    speed = data['speed']
+                    conn.send(('success', 'Speed updated successfully'))
+
+                elif command == 'shutdown':
+                    logging.info('Shutdown command received. Exiting worker process.')
+                    conn.send(('shutdown', 'shutdown'))
+                    break  # This exits the loop, effectively stopping the worker process.
+
+                elif command == 'synthesize':
+
+                    text = data['text']
+                    language = data['language']
+
+                    logging.debug(f'Starting inference for text: {text}')
+
+                    chunks =  tts.inference_stream(
+                        text,
+                        language,
+                        gpt_cond_latent,
+                        speaker_embedding,
+                        stream_chunk_size=stream_chunk_size,
+                        overlap_wav_len=overlap_wav_len,
+                        temperature=temperature,
+                        length_penalty=length_penalty,
+                        repetition_penalty=repetition_penalty,
+                        top_k=top_k,
+                        top_p=top_p,
+                        speed=speed,
+                        enable_text_splitting=enable_text_splitting
+                    )
+
+                    if full_sentences:
+                        chunklist = []
+
+                        for i, chunk in enumerate(chunks):
+                            chunk = postprocess_wave(chunk)
+                            chunklist.append(chunk.tobytes())
+
+                        for chunk in chunklist:
+                            conn.send(('success', chunk))
+                    else:
+                        for i, chunk in enumerate(chunks):
+                            chunk = postprocess_wave(chunk)
+                            conn.send(('success', chunk.tobytes()))                            
+
+                    # Send silent audio
+                    sample_rate = config.audio.sample_rate  
+
+                    if text[-1] in [","]:
+                        silence_duration = 0.2  # add 200ms speaking pause in case of comma
+                    else:
+                        silence_duration = 0.5  # add 500ms speaking pause in case of sentence end
+
+                    silent_samples = int(sample_rate * silence_duration)
+                    silent_chunk = np.zeros(silent_samples, dtype=np.float32)
+                    conn.send(('success', silent_chunk.tobytes()))                        
+
+                    conn.send(('finished', ''))
+        
+        except KeyboardInterrupt:
+            logging.info('Keyboard interrupt received. Exiting worker process.')
+            conn.send(('shutdown', 'shutdown'))
+
+        except Exception as e:
+            logging.error(f"General synthesis error: {e} occured trying to synthesize text {text}")
+
+            tb_str = traceback.format_exc()
+            print (f"Traceback: {tb_str}")
+            print (f"Error: {e}")
+
+            conn.send(('error', str(e)))
+
+    def send_command(self, command, data):
+        """
+        Send a command to the worker process.
+        """
+        message = {'command': command, 'data': data}
+        self.parent_synthesize_pipe.send(message)            
+            
+    def set_cloning_reference(self, cloning_reference_wav: Union[str, List[str]]):
+        """
+        Send an 'update_reference' command and wait for a response.
+        """
+        if not isinstance(cloning_reference_wav, list):
+            cloning_reference_wav = [cloning_reference_wav]        
+        self.send_command('update_reference', {'cloning_reference_wav': cloning_reference_wav})
+        
+        # Wait for the response from the worker process
+        status, result = self.parent_synthesize_pipe.recv()
+        if status == 'success':
+            logging.info('Reference WAV updated successfully')
+        else:
+            logging.error(f'Error updating reference WAV: {cloning_reference_wav}')
+
+        return status, result
+    
+    def set_speed(self, speed: float):
+        """
+        Sets the speed of the speech synthesis.
+        """
+        self.send_command('set_speed', {'speed': speed})
+
+        # Wait for the response from the worker process
+        status, result = self.parent_synthesize_pipe.recv()
+        if status == 'success':
+            logging.info('Speed updated successfully')
+        else:
+            logging.error(f'Error updating speed')
+
+        return status, result
+    
+    def get_stream_info(self):
+        """
+        Returns the PyAudio stream configuration information suitable for Coqui Engine.
+
+        Returns:
+            tuple: A tuple containing the audio format, number of channels, and the sample rate.
+                  - Format (int): The format of the audio stream. pyaudio.paInt16 represents 16-bit integers.
+                  - Channels (int): The number of audio channels. 1 represents mono audio.
+                  - Sample Rate (int): The sample rate of the audio in Hz. 16000 represents 16kHz sample rate.
+        """        
+        return pyaudio.paFloat32, 1, 24000
+    
+    def _prepare_text_for_synthesis(self, text: str):
+        """
+        Splits a text into sentences.
+
+        Args:
+            text (str): Text to prepare for synthesis.
+
+        Returns:
+            text (str): Prepared text.
+        """
+
+        logging.debug (f"Preparing text for synthesis: \"{text}\"")
+
+        if self.prepare_text_for_synthesis_callback:
+            return self.prepare_text_for_synthesis_callback(text)
+
+        # A fast fix for last character, may produce weird sounds if it is with text
+        text = text.strip()
+        text = text.replace("</s>", "")
+        text = re.sub("```.*```", "", text, flags=re.DOTALL)
+        text = re.sub("`.*`", "", text, flags=re.DOTALL)
+        text = re.sub("\(.*\)", "", text, flags=re.DOTALL)
+        text = text.replace("```", "")
+        text = text.replace("...", " ")
+        text = text.replace("»", "")
+        text = text.replace("«", "")
+        text = re.sub(" +", " ", text)
+        #text= re.sub("([^\x00-\x7F]|\w)(\.|\。|\?)",r"\1 \2\2",text)
+        #text= re.sub("([^\x00-\x7F]|\w)(\.|\。|\?)",r"\1 \2",text)
+
+        try:
+            if len(text) > 2 and text[-1] in ["."]:
+                text = text[:-1] 
+            elif len(text) > 2 and text[-1] in ["!", "?", ","]:
+                text = text[:-1] + " " + text[-1]
+            elif len(text) > 3 and text[-2] in ["."]:
+                text = text[:-2] 
+            elif len(text) > 3 and text[-2] in ["!", "?", ","]:
+                text = text[:-2] + " " + text[-2]
+        except Exception as e:
+            logging.warning (f"Error fixing sentence end punctuation: {e}, Text: \"{text}\"")        
+        
+        text = text.strip()
+
+        logging.debug (f"Text after preparation: \"{text}\"")
+
+        return text
+
+    def synthesize(self, 
+                   text: str) -> bool:
+        """
+        Synthesizes text to audio stream.
+
+        Args:
+            text (str): Text to synthesize.
+        """
+
+        with self._synthesize_lock:
+            text = self._prepare_text_for_synthesis(text)
+
+            if len(text) < 1:
+                return
+
+            data = {'text': text, 'language': self.language}
+            self.send_command('synthesize', data)
+
+            status, result = self.parent_synthesize_pipe.recv()
+
+            while not 'finished' in status:
+                if 'shutdown' in status or 'error' in status:
+                    if 'error' in status:
+                        logging.error(f'Error synthesizing text: {text}')
+                        logging.error(f'Error: {result}')
+                    return False
+                self.queue.put(result)
+                status, result = self.parent_synthesize_pipe.recv()
+
+            return True
+    
+    @staticmethod
+    def download_file(url, destination):
+        response = requests.get(url, stream=True)
+        total_size_in_bytes = int(response.headers.get('content-length', 0))
+        block_size = 1024  # 1 Kibibyte
+
+        progress_bar = tqdm(total=total_size_in_bytes, unit='iB', unit_scale=True)
+
+        with open(destination, 'wb') as file:
+            for data in response.iter_content(block_size):
+                progress_bar.update(len(data))
+                file.write(data)
+
+        progress_bar.close()
+
+    @staticmethod
+    def download_model(model_name = "v2.0.2", local_models_path = None):
+
+        # Creating a unique folder for each model version
+        if local_models_path and len(local_models_path) > 0:
+            model_folder = os.path.join(local_models_path, f'{model_name}')
+            logging.info(f"Local models path: \"{model_folder}\"")
+        else:
+            model_folder = os.path.join(os.getcwd(), 'models', f'{model_name}')
+            logging.info(f"Checking for models within application directory: \"{model_folder}\"")
+
+        os.makedirs(model_folder, exist_ok=True)
+        print(model_name)
+
+        files = {
+         "config.json": f"https://huggingface.co/coqui/XTTS-v2/raw/{model_name}/config.json",
+         "model.pth": f"https://huggingface.co/coqui/XTTS-v2/resolve/{model_name}/model.pth?download=true",
+         "vocab.json": f"https://huggingface.co/coqui/XTTS-v2/raw/{model_name}/vocab.json"
+        }
+
+        for file_name, url in files.items():
+            file_path = os.path.join(model_folder, file_name)
+            if not os.path.exists(file_path):
+                logger.info(f"Downloading {file_name} for Model {model_name}...")
+                CoquiEngine.download_file(url, file_path)
+                # r = requests.get(url, allow_redirects=True)
+                # with open(file_path, 'wb') as f:
+                #     f.write(r.content)
+                logging.info(f"{file_name} downloaded successfully.")
+            else:
+                logging.info(f"{file_name} already exists. Skipping download.")
+
+
+        return model_folder            
+
+    def get_voices(self):
+        """
+        Retrieves the installed voices available for the Coqui TTS engine.
+        """
+        # get all files in self.voices_path directory
+        files = os.listdir(self.voices_path)
+
+        voice_file_names = []
+        for file in files:
+            # remove ending .wav or .json from filename
+            if file.endswith(".wav"):
+                file = file[:-4]
+            elif file.endswith(".json"):
+                file = file[:-5]
+            else:
+                continue
+
+            voice_file_names.append(file)
+
+        return voice_file_names 
+    
+    def set_voice(self, voice: Union[str, List[str]]):
+        """
+        Sets the voice to be used for speech synthesis.
+        """
+        self.set_cloning_reference(voice)
+    
+    def set_voice_parameters(self, **voice_parameters):
+        """
+        Sets the voice parameters to be used for speech synthesis.
+
+        Args:
+            **voice_parameters: The voice parameters to be used for speech synthesis.
+
+        This method should be overridden by the derived class to set the desired voice parameters.
+        """
+        pass
+
+    def shutdown(self):
+        """
+        Shuts down the engine by terminating the process and closing the pipes.
+        """
+        # Send shutdown command to the worker process
+        logging.info('Sending shutdown command to the worker process')
+        self.send_command('shutdown', {})
+        
+        # Wait for the worker process to acknowledge the shutdown
+        try:
+            status, _ = self.parent_synthesize_pipe.recv()
+            if 'shutdown' in status:
+                logging.info('Worker process acknowledged shutdown')
+        except EOFError:
+            # Pipe was closed, meaning the process is already down
+            logging.warning('Worker process pipe was closed before shutdown acknowledgement')
+        
+        # Close the pipe connection
+        self.parent_synthesize_pipe.close()
+
+        # Terminate the process
+        logging.info('Terminating the worker process')
+        self.synthesize_process.terminate()
+
+        # Wait for the process to terminate
+        self.synthesize_process.join()
+        logging.info('Worker process has been terminated')
+</"file: xtts_api_server\RealtimeTTS\engines\coqui_engine.py">
+
+<"file: xtts_api_server\RealtimeTTS\engines\base_engine.py">from abc import ABCMeta, ABC, abstractmethod
+from typing import Union
+import shutil
+import queue
+
+# Define a meta class that will automatically call the BaseEngine's __init__ method
+# and also the post_init method if it exists.
+class BaseInitMeta(ABCMeta):
+    def __call__(cls, *args, **kwargs):
+        # Create an instance of the class that this meta class is used on.
+        instance = super().__call__(*args, **kwargs)
+        
+        # Call the __init__ method of BaseEngine to set default properties.
+        BaseEngine.__init__(instance)
+                
+        # If the instance has a post_init method, call it.
+        # This allows subclasses to define additional initialization steps.
+        if hasattr(instance, "post_init"):
+            instance.post_init()
+
+        return instance
+
+# Define a base class for engines with the custom meta class.
+class BaseEngine(ABC, metaclass=BaseInitMeta):
+
+    def __init__(self):
+        self.engine_name = "unknown"
+
+        # Indicates if the engine can handle generators.
+        self.can_consume_generators = False
+        
+        # Queue to manage tasks or data for the engine.
+        self.queue = queue.Queue()
+
+         # Callback to be called when an audio chunk is available.
+        self.on_audio_chunk = None
+
+         # Callback to be called when the engine is starting to synthesize audio.
+        self.on_playback_start = None
+
+    def get_stream_info(self):
+        """
+        Returns the audio stream configuration information suitable for PyAudio.
+
+        Returns:
+            tuple: A tuple containing the audio format, number of channels, and the sample rate.
+                  - Format (int): The format of the audio stream. pyaudio.paInt16 represents 16-bit integers.
+                  - Channels (int): The number of audio channels. 1 represents mono audio.
+                  - Sample Rate (int): The sample rate of the audio in Hz. 16000 represents 16kHz sample rate.
+        """        
+        raise NotImplementedError("The get_stream_info method must be implemented by the derived class.")
+
+    def synthesize(self, 
+                   text: str) -> bool:
+        """
+        Synthesizes text to audio stream.
+
+        Args:
+            text (str): Text to synthesize.
+        """
+        raise NotImplementedError("The synthesize method must be implemented by the derived class.")
+    
+    def get_voices(self):
+        """
+        Retrieves the voices available from the specific voice source.
+
+        This method should be overridden by the derived class to fetch the list of available voices.
+
+        Returns:
+            list: A list containing voice objects representing each available voice. 
+        """
+        raise NotImplementedError("The get_voices method must be implemented by the derived class.")
+    
+    def set_voice(self, voice: Union[str, object]):
+        """
+        Sets the voice to be used for speech synthesis.
+
+        Args:
+            voice (Union[str, object]): The voice to be used for speech synthesis.
+
+        This method should be overridden by the derived class to set the desired voice.
+        """
+        raise NotImplementedError("The set_voice method must be implemented by the derived class.")
+    
+    def set_voice_parameters(self, **voice_parameters):
+        """
+        Sets the voice parameters to be used for speech synthesis.
+
+        Args:
+            **voice_parameters: The voice parameters to be used for speech synthesis.
+
+        This method should be overridden by the derived class to set the desired voice parameters.
+        """
+        raise NotImplementedError("The set_voice_parameters method must be implemented by the derived class.")
+    
+    def shutdown(self):
+        """
+        Shuts down the engine.
+        """
+        pass
+
+    def is_installed(self, lib_name: str) -> bool:
+        """
+        Check if the given library or software is installed and accessible.
+
+        This method uses shutil.which to determine if the given library or software is
+        installed and available in the system's PATH.
+
+        Args:
+            lib_name (str): Name of the library or software to check.
+
+        Returns:
+            bool: True if the library is installed, otherwise False.
+        """        
+        lib = shutil.which(lib_name)
+        if lib is None:
+            return False
+        return True       </"file: xtts_api_server\RealtimeTTS\engines\base_engine.py">
+
+<"file: xtts_api_server\RealtimeTTS\engines\__init__.py">from .base_engine import BaseEngine
+from .coqui_engine import CoquiEngine</"file: xtts_api_server\RealtimeTTS\engines\__init__.py">
+
+<"file: xtts_api_server\RealtimeTTS\coqui_test.py">if __name__ == '__main__':
+    import os
+    import time
+    from RealtimeTTS import TextToAudioStream, CoquiEngine
+
+    def dummy_generator():
+        yield "Hey guys! These here are realtime spoken sentences based on local text synthesis. "
+        yield "With a local, neuronal, cloned voice. So every spoken sentence sounds unique."
+
+    engine = CoquiEngine()
+    stream = TextToAudioStream(engine)
+    
+    print ("Starting to play stream")
+    stream.feed(dummy_generator()).play()
+
+    engine.shutdown()</"file: xtts_api_server\RealtimeTTS\coqui_test.py">
+
+<"file: xtts_api_server\RealtimeTTS\__init__.py">from .text_to_stream import TextToAudioStream
+from .engines import BaseEngine
+from .engines import CoquiEngine</"file: xtts_api_server\RealtimeTTS\__init__.py">
+
+<"file: error.txt">Error minifying docker\.env: Unsupported file format
+Error minifying docker\docker-compose.yml: Unsupported file format
+Error minifying docker\Dockerfile: Unsupported file format
+Error minifying XTTS-api-server.ipynb: Unsupported file format
+Error minifying xtts_api_server\RealtimeTTS\silence.wav: Unsupported file format
+Error minifying xtts_api_server\RealtimeTTS\README.MD: Unsupported file format
+Error minifying pyproject.toml: Unsupported file format
+Error minifying requirements.txt: Unsupported file format
+Error minifying example\male.wav: Unsupported file format
+Error minifying example\female.wav: Unsupported file format
+Error minifying example\calm_female.wav: Unsupported file format
+Error minifying docker\.dockerignore: Unsupported file format
+Error minifying LICENSE: Unsupported file format
+Error minifying .gitignore: Unsupported file format
+Error minifying .github\workflows\build-image.yml: Unsupported file format</"file: error.txt">
+
